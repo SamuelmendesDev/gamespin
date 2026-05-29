@@ -36,6 +36,8 @@ let customTags    = {};
 let activeTagFilter = null;   // null | tagName
 let gogGames      = [];           // GOG library
 let localGames    = [];           // Local library (no store)
+let emulatorGames = [];           // Emulator ROMs
+let emulators     = [];           // Configured emulators
 let installedGog  = new Set();
 
 // ── Global progress tracking ────────────────────────────────────────
@@ -124,41 +126,83 @@ function toggleTheme() {
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
-// ── Auto-updater notifications ─────────────────────────────────────────────────
+// ── Auto-updater ───────────────────────────────────────────────────────────────
+let _updateInfo = null;
+
 if (window.api.onUpdateAvailable) {
-  window.api.onUpdateAvailable((version) => {
-    showUpdateToast(`Atualização ${version} disponível — baixando…`);
+  window.api.onUpdateAvailable((info) => {
+    _updateInfo = info;
+    showUpdateBanner(info);
   });
-  window.api.onUpdateDownloaded(() => {
-    showUpdateToast('Atualização pronta!', true);
+  window.api.onUpdateProgress((info) => {
+    updateBannerProgress(info);
+  });
+  window.api.onUpdateDownloaded((info) => {
+    showUpdateReadyBanner(info);
   });
 }
 
-function showUpdateToast(msg, withInstall = false) {
-  const existing = document.getElementById('update-toast');
-  if (existing) existing.remove();
+function fmt_bytes(bytes) {
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
 
-  const toast = document.createElement('div');
-  toast.id = 'update-toast';
-  toast.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:999;background:#1a9fff;color:white;padding:12px 18px;border-radius:10px;font-size:13px;display:flex;align-items:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3);animation:slideUp .3s ease';
-  toast.innerHTML = `<span>🔄 ${msg}</span>`;
-
-  if (withInstall) {
-    const btn = document.createElement('button');
-    btn.textContent = 'Instalar agora';
-    btn.style.cssText = 'background:white;color:#1a9fff;border:none;border-radius:6px;padding:4px 12px;cursor:pointer;font-weight:600;font-size:12px';
-    btn.onclick = () => window.api.installUpdate();
-    toast.appendChild(btn);
+function getOrCreateBanner() {
+  let b = document.getElementById('update-banner');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'update-banner';
+    document.body.appendChild(b);
   }
+  return b;
+}
 
-  const close = document.createElement('button');
-  close.textContent = '✕';
-  close.style.cssText = 'background:none;border:none;color:rgba(255,255,255,.7);cursor:pointer;font-size:14px;padding:0 4px';
-  close.onclick = () => toast.remove();
-  toast.appendChild(close);
+function showUpdateBanner(info) {
+  const b = getOrCreateBanner();
+  b.className = 'update-banner update-banner-available';
+  b.innerHTML = `
+    <div class="ubanner-icon">🔄</div>
+    <div class="ubanner-body">
+      <div class="ubanner-title">Atualização disponível — <strong>v${esc(info.version)}</strong></div>
+      <div class="ubanner-sub" id="ubanner-sub">Clique em Baixar para atualizar</div>
+      <div class="ubanner-progress-wrap" id="ubanner-progress-wrap" style="display:none">
+        <div class="ubanner-progress-bar"><div class="ubanner-progress-fill" id="ubanner-progress-fill"></div></div>
+        <span class="ubanner-pct" id="ubanner-pct">0%</span>
+      </div>
+    </div>
+    <button class="ubanner-btn" id="ubanner-dl-btn">⬇ Baixar</button>
+    <button class="ubanner-close" id="ubanner-close">✕</button>`;
+  document.getElementById('ubanner-close').onclick = () => b.remove();
+  document.getElementById('ubanner-dl-btn').onclick = () => {
+    document.getElementById('ubanner-dl-btn').style.display = 'none';
+    document.getElementById('ubanner-progress-wrap').style.display = '';
+    document.getElementById('ubanner-sub').textContent = 'Baixando…';
+    window.api.downloadUpdate();
+  };
+}
 
-  document.body.appendChild(toast);
-  if (!withInstall) setTimeout(() => toast?.remove(), 5000);
+function updateBannerProgress(info) {
+  const fill = document.getElementById('ubanner-progress-fill');
+  const pct  = document.getElementById('ubanner-pct');
+  const sub  = document.getElementById('ubanner-sub');
+  if (fill) fill.style.width = info.percent + '%';
+  if (pct)  pct.textContent  = info.percent + '%';
+  if (sub)  sub.textContent  = `Baixando… ${fmt_bytes(info.transferred)} / ${fmt_bytes(info.total)}`;
+}
+
+function showUpdateReadyBanner(info) {
+  const b = getOrCreateBanner();
+  b.className = 'update-banner update-banner-ready';
+  b.innerHTML = `
+    <div class="ubanner-icon">✅</div>
+    <div class="ubanner-body">
+      <div class="ubanner-title">Atualização <strong>v${esc(info.version)}</strong> pronta!</div>
+      <div class="ubanner-sub">O app será reiniciado para instalar.</div>
+    </div>
+    <button class="ubanner-btn ubanner-btn-install" id="ubanner-install-btn">🚀 Instalar agora</button>
+    <button class="ubanner-close" id="ubanner-close">✕</button>`;
+  document.getElementById('ubanner-close').onclick = () => b.remove();
+  document.getElementById('ubanner-install-btn').onclick = () => window.api.installUpdate();
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
@@ -187,6 +231,16 @@ window.addEventListener('DOMContentLoaded', async () => {
   for (const g of localGames) {
     genreData[g.id] = genreData[g.id] || {};
     if (g.coverPath) genreData[g.id].localImage = 'file://' + g.coverPath.replace(/\\/g, '/');
+  }
+
+  // Load emulators + emulator games
+  emulators = await window.api.emulatorsGet() || [];
+  const savedEmuGames = await window.api.emulatorGamesGet() || [];
+  emulatorGames = savedEmuGames.map(normalizeEmulatorGame);
+  for (const g of emulatorGames) {
+    genreData[g.id] = genreData[g.id] || {};
+    if (g.coverPath) genreData[g.id].localImage = 'file://' + g.coverPath.replace(/\\/g, '/');
+    if (g.coverUrl)  genreData[g.id].header     = g.coverUrl;
   }
   currentConfig = cfg || {};
   if (cfg.key && cfg.steamid) {
@@ -230,6 +284,13 @@ window.addEventListener('DOMContentLoaded', async () => {
 function bindEvents() {
   // Settings
   $('btn-open-settings').addEventListener('click', openSettings);
+  $('btn-bigpicture').addEventListener('click', openBigPicture);
+  $('bp-exit-btn').addEventListener('click', closeBigPicture);
+
+  // F11 toggles Big Picture
+  document.addEventListener('keydown', e => {
+    if (e.key === 'F11' && !bpActive) { e.preventDefault(); openBigPicture(); }
+  });
   $('btn-theme-toggle').addEventListener('click', toggleTheme);
   $('btn-open-settings-connect').addEventListener('click', openSettings);
   $('btn-empty-connect').addEventListener('click', openSettings);
@@ -277,6 +338,7 @@ function bindEvents() {
   $('btn-clear-all-filters').addEventListener('click', clearAllFilters);
   $('btn-add-local-game').addEventListener('click', addLocalGame);
   $('btn-scan-local-dir').addEventListener('click', scanLocalDir);
+  $('btn-open-emu-manager').addEventListener('click', openEmulatorManager);
 
   // SteamGridDB
 
@@ -316,7 +378,7 @@ function handleAction(action, data) {
   if (action === 'highlight')    { closeModal(); showFeatured(getGameById(id)); }
   if (action === 'local-img') {
     const g = getGameById(id);
-    if (g?.source === 'local') pickLocalGameCover(id);
+    if (g?.source === 'local' || g?.source === 'emulator') pickLocalGameCover(id);
     else pickLocalImage(id);
   }
   if (action === 'edit-name')    { editGameName(id); }
@@ -328,6 +390,8 @@ function handleAction(action, data) {
   if (action === 'clear-tag-filter') { setTagFilter(null); }
   if (action === 'remove-local')     { removeLocalGame(id); }
   if (action === 'add-local-game')   { addLocalGame(); }
+  if (action === 'open-emu-manager')  { openEmulatorManager(); }
+  if (action === 'remove-emu-game')   { removeEmulatorGame(id); }
 }
 
 
@@ -381,6 +445,7 @@ async function savePath() {
   $('cfg-steam-info').textContent = `${steamGames.length} jogos · ${installedSteam.size} instalados`;
   renderGames();
 }
+
 
 async function autoDetectSteam2() {
   const res = await window.api.detectSteam();
@@ -737,6 +802,8 @@ function showLibraryUI() {
   document.querySelector('.tab[data-tab="gog"]').style.display   = gogGames.length   > 0 ? '' : 'none';
   const localTab = document.querySelector('.tab[data-tab="local"]');
   if (localTab) localTab.style.display = '';
+  const emuTab = document.querySelector('.tab[data-tab="emulator"]');
+  if (emuTab) emuTab.style.display = '';
   const hiddenTab = document.querySelector('.tab[data-tab="hidden"]');
   if (hiddenTab) {
     hiddenTab.style.display = hiddenGames.size > 0 ? '' : 'none';
@@ -748,9 +815,10 @@ function showLibraryUI() {
 
 // ── Merge libraries ────────────────────────────────────────────────────────────
 function mergeAndRender() {
-  allGames = [...steamGames, ...epicGames, ...gogGames, ...localGames];
+  allGames = [...steamGames, ...epicGames, ...gogGames, ...localGames, ...emulatorGames];
   showLibraryUI();
   applyFilters();
+  if (bpActive) { bpRenderTabs(); bpRenderGrid(); bpFocus(bpFocusIdx); }
 }
 
 // ── Tabs ───────────────────────────────────────────────────────────────────────
@@ -766,6 +834,7 @@ function getTabGames() {
   if (currentTab === 'epic')      return epicGames;
   if (currentTab === 'gog')       return gogGames;
   if (currentTab === 'local')     return localGames;
+  if (currentTab === 'emulator')  return emulatorGames;
   if (currentTab === 'favorites') return allGames.filter(g => favorites.has(g.id));
   if (currentTab === 'hidden')    return allGames.filter(g => hiddenGames.has(g.id));
   return allGames;
@@ -803,7 +872,8 @@ function isInstalled(g) {
   if (g.source === 'steam') return installedSteam.has(g.id);
   if (g.source === 'epic')  return installedEpic.has(g.id) || g.installed;
   if (g.source === 'gog')   return installedGog.has(g.id) || g.installed;
-  if (g.source === 'local') return true;
+  if (g.source === 'local')    return true;
+  if (g.source === 'emulator') return true;
   return false;
 }
 
@@ -862,7 +932,7 @@ function renderGames() {
     // Source badge
     const srcBadge = document.createElement('div');
     srcBadge.className = `source-mini-badge ${g.source}-mini`;
-    srcBadge.textContent = g.source === 'steam' ? 'S' : g.source === 'epic' ? 'E' : g.source === 'gog' ? 'G' : '📁';
+    srcBadge.textContent = g.source === 'steam' ? 'S' : g.source === 'epic' ? 'E' : g.source === 'gog' ? 'G' : g.source === 'emulator' ? '🕹' : '📁';
     card.appendChild(srcBadge);
 
     // Image — skeleton if no data yet, lazy loaded otherwise
@@ -1103,7 +1173,7 @@ async function editGameName(id) {
 
   // Build inline edit popup
   const overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:500;display:flex;align-items:center;justify-content:center';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:950;display:flex;align-items:center;justify-content:center';
 
   const box = document.createElement('div');
   box.style.cssText = 'background:#13161d;border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:28px 32px;width:420px;display:flex;flex-direction:column;gap:14px';
@@ -1171,6 +1241,8 @@ async function launchGame(id) {
     window.api.gogLaunch({ gogId: game.gogId, installed: isInstalled(game) });
   } else if (game.source === 'local') {
     window.api.localLibraryLaunch(game.exePath);
+  } else if (game.source === 'emulator') {
+    window.api.emulatorLaunch({ emulatorId: game.emulatorId, romPath: game.romPath });
   }
 }
 
@@ -1277,6 +1349,8 @@ function renderModal(box, game, d) {
     ? '<span class="source-badge epic-badge">EPIC</span>'
     : game.source === 'gog'
     ? '<span class="source-badge gog-badge">GOG</span>'
+    : game.source === 'emulator'
+    ? '<span class="source-badge emu-badge">EMU</span>'
     : '<span class="source-badge local-badge">LOCAL</span>';
   const genreTags = genres.map(g=>`<span class="genre-tag">${esc(g)}</span>`).join('');
   const catTags   = cats.map(c=>`<span class="genre-tag cat">${esc(c)}</span>`).join('');
@@ -1295,7 +1369,7 @@ function renderModal(box, game, d) {
   body.innerHTML = `<div class="modal-name">${esc(game.name)} ${srcBadge}</div>`
     + (genreTags||catTags ? `<div class="modal-tags">${genreTags}${catTags}</div>` : '')
     + `<div class="modal-meta"><span>⏱ ${game.playtime ? fmtTime(game.playtime) : '—'}</span>`
-    + `<span>${installed?'✅ Instalado':'☁️ Não instalado'}</span></div>`
+    + (game.source==='emulator' ? `<span>🕹 ${esc(getEmulatorName(game.emulatorId))}</span><span>.${game.ext||'rom'}</span>` : `<span>${installed?'✅ Instalado':'☁️ Não instalado'}</span>`) + '</div>'
     + hltbHtml
     + `<div class="modal-desc">${d.description ? esc(d.description) : '<em style="opacity:.4">Carregando…</em>'}</div>`
     + screensHtml;
@@ -1329,6 +1403,11 @@ function renderModal(box, game, d) {
     const removeBtn = mkBtn('btn-ghost small', '🗑 Remover', 'remove-local', game.id);
     removeBtn.style.color = '#e05c5c';
     actions.appendChild(removeBtn);
+  }
+  if (game.source === 'emulator') {
+    const removeEmuBtn = mkBtn('btn-ghost small', '🗑 Remover', 'remove-emu-game', game.id);
+    removeEmuBtn.style.color = '#e05c5c';
+    actions.appendChild(removeEmuBtn);
   }
   const cl = mkBtn('btn-ghost small','Fechar','close');
   cl.style.marginLeft='auto'; actions.appendChild(cl);
@@ -1508,7 +1587,7 @@ function applyEpicUpdates(updates) {
 
 // ── IGDB genre background fetch ────────────────────────────────────────────────
 async function fetchIgdbGenresBackground(source) {
-  const sourceGames = source === 'steam' ? steamGames : source === 'gog' ? gogGames : source === 'local' ? localGames : epicGames;
+  const sourceGames = source === 'steam' ? steamGames : source === 'gog' ? gogGames : source === 'local' ? localGames : source === 'emulator' ? emulatorGames : epicGames;
   if (!sourceGames.length) return;
 
   const toFetch = sourceGames
@@ -1603,6 +1682,333 @@ async function clearGenreCache() {
 
 // ── Local Library ─────────────────────────────────────────────────────────────
 
+
+function normalizeEmulatorGame(entry) {
+  return {
+    id:          entry.id,
+    name:        entry.name,
+    source:      'emulator',
+    emulatorId:  entry.emulatorId,
+    romPath:     entry.romPath,
+    coverPath:   entry.coverPath || null,
+    coverUrl:    entry.coverUrl  || null,
+    ext:         entry.ext       || '',
+    addedAt:     entry.addedAt   || 0,
+    playtime:    0,
+    installed:   true
+  };
+}
+
+function getEmulatorName(id) {
+  const emu = emulators.find(e => e.id === id);
+  return emu ? emu.name : 'Emulador';
+}
+
+async function removeEmulatorGame(id) {
+  if (!confirm('Remover esta ROM da biblioteca?')) return;
+  emulatorGames = emulatorGames.filter(g => g.id !== id);
+  await window.api.emulatorGamesSave(emulatorGames.map(g => ({
+    id: g.id, name: g.name, emulatorId: g.emulatorId, romPath: g.romPath,
+    coverPath: g.coverPath, coverUrl: g.coverUrl, ext: g.ext, addedAt: g.addedAt
+  })));
+  closeModal();
+  mergeAndRender();
+  showLibraryUI();
+}
+
+// ── Emulator Manager ──────────────────────────────────────────────────────────
+function openEmulatorManager() {
+  const overlay = document.createElement('div');
+  overlay.id = 'emu-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:950;display:flex;align-items:center;justify-content:center;padding:20px';
+
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:16px;width:680px;max-width:95vw;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden';
+
+  const cleanup = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
+
+  function render() {
+    panel.innerHTML = '';
+
+    // Header
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'padding:22px 24px 16px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;flex-shrink:0';
+    hdr.innerHTML = `<div><div style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px;color:var(--text,#e8eaf0)">🕹 EMULADORES</div><div style="font-size:12px;color:var(--muted,#6b7280);margin-top:2px">Configure emuladores e escaneie pastas de ROMs</div></div><button id="emu-close" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;padding:4px 8px">✕</button>`;
+    panel.appendChild(hdr);
+    document.getElementById('emu-close')?.addEventListener('click', cleanup);
+
+    const body = document.createElement('div');
+    body.style.cssText = 'overflow-y:auto;flex:1;padding:20px 24px;display:flex;flex-direction:column;gap:16px';
+
+    // ── Existing emulators
+    if (emulators.length) {
+      emulators.forEach(emu => {
+        const card = document.createElement('div');
+        card.style.cssText = 'background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px';
+
+        const topRow = document.createElement('div');
+        topRow.style.cssText = 'display:flex;align-items:center;gap:10px';
+        topRow.innerHTML = `<span style="font-size:20px">🕹</span><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:14px;color:var(--text,#e8eaf0)">${esc(emu.name)}</div><div style="font-size:11px;color:var(--muted,#6b7280);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(emu.exePath)}">${esc(emu.exePath)}</div></div>`;
+
+        const extBadge = document.createElement('span');
+        extBadge.style.cssText = 'font-size:11px;color:var(--muted);background:rgba(255,255,255,.07);padding:3px 8px;border-radius:6px;white-space:nowrap;flex-shrink:0';
+        extBadge.textContent = (emu.extensions||[]).join(', ') || 'todas';
+        topRow.appendChild(extBadge);
+        card.appendChild(topRow);
+
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
+
+        const scanBtn = document.createElement('button');
+        scanBtn.style.cssText = 'padding:6px 14px;border-radius:8px;border:none;background:linear-gradient(135deg,#6366f1,#4f46e5);color:white;cursor:pointer;font-size:12px;font-weight:600';
+        scanBtn.textContent = '📂 Escanear ROMs';
+        scanBtn.onclick = () => { cleanup(); scanRoms(emu); };
+
+        const delBtn = document.createElement('button');
+        delBtn.style.cssText = 'padding:6px 14px;border-radius:8px;border:1px solid rgba(224,92,92,.4);background:rgba(224,92,92,.1);color:#e05c5c;cursor:pointer;font-size:12px';
+        delBtn.textContent = '🗑 Remover';
+        delBtn.onclick = async () => {
+          if (!confirm(`Remover o emulador "${emu.name}"? Os jogos associados serão removidos.`)) return;
+          emulators = emulators.filter(e => e.id !== emu.id);
+          emulatorGames = emulatorGames.filter(g => g.emulatorId !== emu.id);
+          await window.api.emulatorsSave(emulators);
+          await window.api.emulatorGamesSave(emulatorGames.map(serializeEmuGame));
+          mergeAndRender(); showLibraryUI(); render();
+        };
+
+        btnRow.appendChild(scanBtn);
+        btnRow.appendChild(delBtn);
+        card.appendChild(btnRow);
+        body.appendChild(card);
+      });
+    } else {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'text-align:center;padding:24px;color:var(--muted,#6b7280);font-size:13px';
+      empty.textContent = 'Nenhum emulador configurado. Adicione um abaixo.';
+      body.appendChild(empty);
+    }
+
+    // ── Add new emulator form
+    const divider = document.createElement('div');
+    divider.style.cssText = 'border-top:1px solid rgba(255,255,255,.08);padding-top:16px';
+
+    const formTitle = document.createElement('div');
+    formTitle.style.cssText = 'font-family:"Bebas Neue",sans-serif;font-size:16px;letter-spacing:1.5px;color:var(--text,#e8eaf0);margin-bottom:12px';
+    formTitle.textContent = '+ ADICIONAR EMULADOR';
+    divider.appendChild(formTitle);
+
+    // Name field
+    const nameRow = document.createElement('div');
+    nameRow.style.cssText = 'display:flex;gap:8px;margin-bottom:10px';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text'; nameInput.placeholder = 'Nome do emulador (ex: PCSX2, RPCS3, RetroArch…)';
+    nameInput.style.cssText = 'flex:1;background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:9px 12px;color:var(--text,#e8eaf0);font-size:13px;outline:none';
+    nameRow.appendChild(nameInput);
+    divider.appendChild(nameRow);
+
+    // Exe picker
+    const exeRow = document.createElement('div');
+    exeRow.style.cssText = 'display:flex;gap:8px;margin-bottom:10px;align-items:center';
+    const exeInput = document.createElement('input');
+    exeInput.type = 'text'; exeInput.placeholder = 'Caminho do executável…'; exeInput.readOnly = true;
+    exeInput.style.cssText = 'flex:1;background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:9px 12px;color:var(--text,#e8eaf0);font-size:12px;outline:none';
+    const exeBtn = document.createElement('button');
+    exeBtn.textContent = '📂 Escolher .exe';
+    exeBtn.style.cssText = 'padding:9px 14px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:none;color:var(--text,#e8eaf0);cursor:pointer;font-size:12px;white-space:nowrap';
+    exeBtn.onclick = async () => {
+      const p = await window.api.emulatorsPickExe();
+      if (p) { exeInput.value = p; if (!nameInput.value) nameInput.value = require ? '' : p.split(/[\/]/).pop().replace(/\.exe$/i,''); }
+    };
+    exeRow.appendChild(exeInput); exeRow.appendChild(exeBtn);
+    divider.appendChild(exeRow);
+
+    // Extensions field
+    const extRow = document.createElement('div');
+    extRow.style.cssText = 'display:flex;gap:8px;margin-bottom:14px;align-items:center';
+    const extInput = document.createElement('input');
+    extInput.type = 'text'; extInput.placeholder = 'Extensões de ROM (ex: iso, bin, nes) — separadas por vírgula ou espaço';
+    extInput.style.cssText = 'flex:1;background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:9px 12px;color:var(--text,#e8eaf0);font-size:13px;outline:none';
+    extRow.appendChild(extInput);
+    divider.appendChild(extRow);
+
+    const addEmuBtn = document.createElement('button');
+    addEmuBtn.style.cssText = 'padding:10px 22px;border-radius:8px;border:none;background:linear-gradient(135deg,#f97316,#ea580c);color:white;font-size:13px;font-weight:600;cursor:pointer';
+    addEmuBtn.textContent = '+ Adicionar Emulador';
+    addEmuBtn.onclick = async () => {
+      const name    = nameInput.value.trim();
+      const exePath = exeInput.value.trim();
+      if (!name || !exePath) { nameInput.style.borderColor = !name ? '#e05c5c' : ''; exeInput.style.borderColor = !exePath ? '#e05c5c' : ''; return; }
+      const extensions = extInput.value.split(/[,\s]+/).map(e => e.trim().toLowerCase().replace(/^\./, '')).filter(Boolean);
+      const emu = { id: 'emu_' + Date.now(), name, exePath, extensions };
+      emulators.push(emu);
+      await window.api.emulatorsSave(emulators);
+      render();
+    };
+    divider.appendChild(addEmuBtn);
+    body.appendChild(divider);
+    panel.appendChild(body);
+  }
+
+  render();
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+}
+
+function serializeEmuGame(g) {
+  return { id: g.id, name: g.name, emulatorId: g.emulatorId, romPath: g.romPath, coverPath: g.coverPath, coverUrl: g.coverUrl, ext: g.ext, addedAt: g.addedAt };
+}
+
+async function scanRoms(emu) {
+  const result = await window.api.emulatorScanRoms({ extensions: emu.extensions || [] });
+  if (!result) return;
+  const { roms } = result;
+  if (!roms.length) { alert('Nenhuma ROM encontrada com as extensões configuradas.'); return; }
+
+  const existingPaths = new Set(emulatorGames.map(g => g.romPath));
+  const newRoms = roms.filter(r => !existingPaths.has(r.romPath));
+  if (!newRoms.length) { alert('Todas as ROMs já estão na biblioteca.'); return; }
+
+  openRomScanPreviewDialog(emu, newRoms);
+}
+
+function openRomScanPreviewDialog(emu, roms) {
+  const items = roms.map((r, i) => ({
+    _tmpId:   'rom_' + i,
+    name:     r.name,
+    romPath:  r.romPath,
+    ext:      r.ext,
+    coverUrl: null,
+    selected: true,
+    fetching: false
+  }));
+
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:950;display:flex;align-items:center;justify-content:center;padding:20px';
+
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:16px;width:720px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden';
+
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'padding:20px 24px 14px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;flex-shrink:0';
+  hdr.innerHTML = `<div><div style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;color:var(--text,#e8eaf0)">🕹 ROMs — ${esc(emu.name)}</div><div style="font-size:12px;color:var(--muted,#6b7280);margin-top:2px">${items.length} ROM${items.length!==1?'s':''} encontrada${items.length!==1?'s':''}</div></div><button id="rom-close" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;padding:4px 8px">✕</button>`;
+  panel.appendChild(hdr);
+
+  const progressWrap = document.createElement('div');
+  progressWrap.style.cssText = 'padding:10px 24px;background:rgba(249,115,22,.07);border-bottom:1px solid rgba(255,255,255,.06);flex-shrink:0;display:none';
+  progressWrap.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px"><span style="font-size:12px;color:var(--muted)" id="rom-prog-lbl">Buscando capas…</span><span style="font-size:12px;font-weight:600;color:#f97316" id="rom-prog-pct">0%</span></div><div style="height:4px;background:rgba(255,255,255,.08);border-radius:2px"><div id="rom-prog-fill" style="height:100%;background:#f97316;border-radius:2px;width:0%;transition:width .3s"></div></div>`;
+  panel.appendChild(progressWrap);
+
+  const selRow = document.createElement('div');
+  selRow.style.cssText = 'padding:10px 24px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.06)';
+  selRow.innerHTML = `<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text)"><input type="checkbox" id="rom-sel-all" checked style="width:15px;height:15px;accent-color:#f97316"> Selecionar todos</label><span id="rom-sel-count" style="font-size:12px;color:var(--muted)">${items.length} selecionados</span>`;
+  panel.appendChild(selRow);
+
+  const list = document.createElement('div');
+  list.style.cssText = 'overflow-y:auto;flex:1;padding:12px 16px;display:flex;flex-direction:column;gap:5px';
+  panel.appendChild(list);
+
+  const footer = document.createElement('div');
+  footer.style.cssText = 'padding:14px 24px;border-top:1px solid rgba(255,255,255,.08);display:flex;gap:10px;justify-content:flex-end;flex-shrink:0';
+  footer.innerHTML = `<button id="rom-cancel" style="padding:9px 18px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:none;color:var(--muted);cursor:pointer;font-size:13px">Cancelar</button><button id="rom-add" style="padding:9px 20px;border-radius:8px;border:none;background:linear-gradient(135deg,#f97316,#ea580c);color:white;cursor:pointer;font-size:13px;font-weight:600">Adicionar Selecionadas</button>`;
+  panel.appendChild(footer);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  function updateCount() {
+    const n = items.filter(i => i.selected).length;
+    const el = document.getElementById('rom-sel-count');
+    if (el) el.textContent = `${n} selecionada${n!==1?'s':''}`;
+    const btn = document.getElementById('rom-add');
+    if (btn) btn.disabled = n === 0;
+  }
+
+  function renderList() {
+    list.innerHTML = '';
+    items.forEach(item => {
+      const row = document.createElement('div');
+      row.id = 'rom-row-' + item._tmpId;
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:9px;background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.05)';
+      const cb = document.createElement('input');
+      cb.type='checkbox'; cb.checked=item.selected; cb.style.cssText='width:14px;height:14px;accent-color:#f97316;flex-shrink:0;cursor:pointer';
+      cb.addEventListener('change', () => { item.selected=cb.checked; updateCount(); const sa=document.getElementById('rom-sel-all'); if(sa) sa.checked=items.every(i=>i.selected); });
+      const cw = document.createElement('div');
+      cw.style.cssText='width:36px;height:50px;border-radius:5px;overflow:hidden;flex-shrink:0;background:rgba(255,255,255,.05);display:flex;align-items:center;justify-content:center;font-size:16px';
+      if (item.coverUrl) { const img=document.createElement('img'); img.src=item.coverUrl; img.style.cssText='width:100%;height:100%;object-fit:cover'; img.addEventListener('error',()=>{cw.innerHTML='🕹';}); cw.appendChild(img); }
+      else if (item.fetching) { cw.innerHTML='<div style="width:18px;height:18px;border:2px solid rgba(255,255,255,.2);border-top-color:#f97316;border-radius:50%;animation:spin .7s linear infinite"></div>'; }
+      else { cw.textContent='🕹'; }
+      const info = document.createElement('div'); info.style.cssText='flex:1;min-width:0';
+      const nameEl = document.createElement('input'); nameEl.type='text'; nameEl.value=item.name;
+      nameEl.style.cssText='background:transparent;border:none;border-bottom:1px solid transparent;color:var(--text,#e8eaf0);font-size:12px;font-weight:600;width:100%;outline:none;padding:1px 0;transition:border-color .15s';
+      nameEl.addEventListener('focus',()=>nameEl.style.borderBottomColor='#f97316');
+      nameEl.addEventListener('blur',()=>{nameEl.style.borderBottomColor='transparent';item.name=nameEl.value.trim()||item.name;nameEl.value=item.name;});
+      nameEl.addEventListener('keydown',e=>{if(e.key==='Enter')nameEl.blur();});
+      const extEl = document.createElement('span'); extEl.style.cssText='font-size:10px;color:var(--muted);'; extEl.textContent='.'+item.ext+' · '+item.romPath.split(/[\/]/).pop();
+      info.appendChild(nameEl); info.appendChild(extEl);
+      row.appendChild(cb); row.appendChild(cw); row.appendChild(info);
+      list.appendChild(row);
+    });
+  }
+  renderList(); updateCount();
+
+  document.getElementById('rom-sel-all').addEventListener('change', e => { items.forEach(i=>i.selected=e.target.checked); renderList(); updateCount(); });
+  const cleanup2 = () => overlay.remove();
+  document.getElementById('rom-close').addEventListener('click', cleanup2);
+  document.getElementById('rom-cancel').addEventListener('click', cleanup2);
+  overlay.addEventListener('click', e => { if(e.target===overlay) cleanup2(); });
+
+  document.getElementById('rom-add').addEventListener('click', async () => {
+    const selected = items.filter(i => i.selected);
+    if (!selected.length) return;
+    const btn = document.getElementById('rom-add');
+    btn.disabled=true; btn.textContent='Adicionando…';
+    for (const item of selected) {
+      const id = 'emugame_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+      const entry = { id, name: item.name, emulatorId: emu.id, romPath: item.romPath, coverPath: null, coverUrl: item.coverUrl||null, ext: item.ext, addedAt: Date.now() };
+      const game = normalizeEmulatorGame(entry);
+      emulatorGames.push(game);
+      genreData[game.id] = {};
+      if (item.coverUrl) genreData[game.id].header = item.coverUrl;
+    }
+    await window.api.emulatorGamesSave(emulatorGames.map(serializeEmuGame));
+    cleanup2();
+    mergeAndRender(); showLibraryUI(); switchTab('emulator');
+    fetchIgdbGenresBackground('emulator');
+  });
+
+  // Fetch covers in background
+  setTimeout(async () => {
+    progressWrap.style.display='';
+    let done=0; const total=items.length;
+    const updateProg = () => {
+      const pct=Math.round((done/total)*100);
+      const fill=document.getElementById('rom-prog-fill');
+      const pctEl=document.getElementById('rom-prog-pct');
+      const lbl=document.getElementById('rom-prog-lbl');
+      if(fill) fill.style.width=pct+'%';
+      if(pctEl) pctEl.textContent=pct+'%';
+      if(lbl) lbl.textContent=done>=total?'✓ Capas carregadas':`Buscando capas… ${done}/${total}`;
+    };
+    items.forEach(i=>{i.fetching=true;}); renderList();
+    const CONCUR=3;
+    async function fetchCover(item) {
+      try {
+        const res = await window.api.localLibraryFetchCovers([{id:item._tmpId,name:item.name}]);
+        if(res&&res[item._tmpId]) item.coverUrl=res[item._tmpId];
+      } catch {}
+      item.fetching=false; done++; updateProg();
+      const row=document.getElementById('rom-row-'+item._tmpId);
+      if(row) {
+        const cw=row.children[1];
+        if(item.coverUrl){cw.innerHTML='';const img=document.createElement('img');img.src=item.coverUrl;img.style.cssText='width:100%;height:100%;object-fit:cover';img.addEventListener('error',()=>{cw.innerHTML='🕹';});cw.appendChild(img);}
+        else{cw.innerHTML='🕹';}
+      }
+    }
+    for(let i=0;i<total;i+=CONCUR){await Promise.all(items.slice(i,i+CONCUR).map(fetchCover));}
+    if(done>=total) setTimeout(()=>{if(progressWrap.parentNode)progressWrap.style.display='none';},2000);
+  },100);
+}
+
 function normalizeLocalGame(entry) {
   return {
     id:       entry.id,
@@ -1664,7 +2070,7 @@ function openScanPreviewDialog(candidates) {
 
   const overlay = document.createElement('div');
   overlay.id = 'scan-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:700;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:950;display:flex;align-items:center;justify-content:center;padding:20px';
 
   const panel = document.createElement('div');
   panel.style.cssText = 'background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:16px;width:720px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden';
@@ -1807,7 +2213,13 @@ async function removeLocalGame(id) {
 async function pickLocalGameCover(id) {
   const filePath = await window.api.localLibraryPickCover();
   if (!filePath) return;
-  await window.api.localLibraryUpdate({ id, coverPath: filePath });
+  const emuGame = emulatorGames.find(g => g.id === id);
+  if (emuGame) {
+    emuGame.coverPath = filePath;
+    await window.api.emulatorGamesSave(emulatorGames.map(serializeEmuGame));
+  } else {
+    await window.api.localLibraryUpdate({ id, coverPath: filePath });
+  }
   const game = localGames.find(g => g.id === id);
   if (game) game.coverPath = filePath;
   if (!genreData[id]) genreData[id] = {};
@@ -1901,7 +2313,7 @@ function openTagsPopup(gameId) {
 
   const overlay = document.createElement('div');
   overlay.id = 'tags-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:600;display:flex;align-items:center;justify-content:center';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:950;display:flex;align-items:center;justify-content:center';
 
   const box = document.createElement('div');
   box.style.cssText = 'background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:28px 28px 22px;width:420px;max-width:92vw;display:flex;flex-direction:column;gap:16px;box-shadow:0 20px 60px rgba(0,0,0,.5)';
@@ -1920,7 +2332,7 @@ function openTagsPopup(gameId) {
     hdr.appendChild(closeX);
     box.appendChild(hdr);
 
-    // Existing tags with toggle
+    // Existing tags with toggle + delete
     const gameTags = getGameTags(gameId);
     const allNames = Object.keys(customTags);
     if (allNames.length) {
@@ -1929,8 +2341,13 @@ function openTagsPopup(gameId) {
       allNames.forEach(name => {
         const t      = customTags[name];
         const active = gameTags.includes(name);
-        const pill   = document.createElement('button');
-        pill.style.cssText = `display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:999px;border:2px solid ${t.color};background:${active ? t.color+'33' : 'transparent'};color:var(--text,#e8eaf0);cursor:pointer;font-size:13px;font-weight:500;transition:all .15s`;
+
+        const wrap = document.createElement('div');
+        wrap.style.cssText = `display:inline-flex;align-items:center;border-radius:999px;border:2px solid ${t.color};background:${active ? t.color+'33' : 'transparent'};overflow:hidden;transition:all .15s`;
+
+        // Toggle pill button
+        const pill = document.createElement('button');
+        pill.style.cssText = `display:inline-flex;align-items:center;gap:6px;padding:5px 10px 5px 12px;background:none;border:none;color:var(--text,#e8eaf0);cursor:pointer;font-size:13px;font-weight:500`;
         pill.innerHTML = `<span style="width:9px;height:9px;border-radius:50%;background:${t.color};display:inline-block;flex-shrink:0"></span>${esc(name)}${active ? ' ✓' : ''}`;
         pill.title = active ? 'Remover tag' : 'Adicionar tag';
         pill.onclick = async () => {
@@ -1941,9 +2358,19 @@ function openTagsPopup(gameId) {
           renderGames();
           render();
         };
-        // Right-click or long-press → delete tag
-        pill.addEventListener('contextmenu', e => { e.preventDefault(); confirmDeleteTag(name); });
-        list.appendChild(pill);
+
+        // Delete button
+        const delBtn = document.createElement('button');
+        delBtn.style.cssText = `background:none;border:none;border-left:1px solid ${t.color}44;color:var(--muted,#6b7280);cursor:pointer;padding:5px 8px;font-size:11px;line-height:1;transition:color .15s,background .15s`;
+        delBtn.textContent = '✕';
+        delBtn.title = `Excluir tag "${name}"`;
+        delBtn.onmouseenter = () => { delBtn.style.color = '#e05c5c'; delBtn.style.background = 'rgba(224,92,92,.15)'; };
+        delBtn.onmouseleave = () => { delBtn.style.color = 'var(--muted,#6b7280)'; delBtn.style.background = 'none'; };
+        delBtn.onclick = (e) => { e.stopPropagation(); confirmDeleteTag(name); };
+
+        wrap.appendChild(pill);
+        wrap.appendChild(delBtn);
+        list.appendChild(wrap);
       });
       box.appendChild(list);
     }
@@ -2005,13 +2432,6 @@ function openTagsPopup(gameId) {
     formRow.appendChild(addBtn);
     box.appendChild(formRow);
     box.appendChild(colorRow);
-
-    if (Object.keys(customTags).length) {
-      const hint = document.createElement('div');
-      hint.style.cssText = 'font-size:11px;color:var(--muted,#6b7280)';
-      hint.textContent = 'Clique com o botão direito em uma tag para excluí-la.';
-      box.appendChild(hint);
-    }
   }
 
   async function confirmDeleteTag(name) {
@@ -2031,6 +2451,242 @@ function openTagsPopup(gameId) {
   overlay.appendChild(box);
   document.body.appendChild(overlay);
   setTimeout(() => overlay.querySelector('input')?.focus(), 50);
+}
+
+
+
+
+// ── Big Picture Mode ─────────────────────────────────────────────────────────
+let bpActive    = false;
+let bpFocusIdx  = 0;
+let bpGames     = [];
+let bpQuery     = '';
+let bpTab       = 'all';
+let bpClockTick = null;
+
+function getBpGames() {
+  const q = bpQuery.toLowerCase();
+  return allGames
+    .filter(g => !hiddenGames.has(g.id))
+    .filter(g => {
+      if (bpTab === 'all')       return true;
+      if (bpTab === 'favorites') return favorites.has(g.id);
+      return g.source === bpTab;
+    })
+    .filter(g => !q || g.name.toLowerCase().includes(q));
+}
+
+async function openBigPicture() {
+  bpActive = true;
+  bpQuery  = '';
+  bpTab    = 'all';
+  document.getElementById('bp-overlay').style.display = 'flex';
+  document.getElementById('bp-search').value = '';
+  document.body.classList.add('bp-mode');
+  await window.api.toggleFullscreen();
+  bpRenderTabs();
+  bpRenderGrid();
+  bpFocus(0);
+  bpStartClock();
+  document.getElementById('bp-search').addEventListener('input', bpOnSearch);
+  document.addEventListener('keydown', bpKeyHandler);
+}
+
+async function closeBigPicture() {
+  bpActive = false;
+  document.getElementById('bp-overlay').style.display = 'none';
+  document.body.classList.remove('bp-mode');
+  clearInterval(bpClockTick);
+  document.removeEventListener('keydown', bpKeyHandler);
+  const isFs = await window.api.getFullscreen();
+  if (isFs) await window.api.toggleFullscreen();
+}
+
+function bpStartClock() {
+  const el = document.getElementById('bp-clock');
+  const tick = () => {
+    const now = new Date();
+    el.textContent = now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  };
+  tick();
+  bpClockTick = setInterval(tick, 10000);
+}
+
+function bpOnSearch(e) {
+  bpQuery = e.target.value.trim();
+  bpRenderTabs();
+  bpRenderGrid();
+  bpFocus(0);
+}
+
+function bpRenderTabs() {
+  const container = document.getElementById('bp-tabs');
+  if (!container) return;
+  container.innerHTML = '';
+
+  const sources = [
+    { id: 'all',       label: 'Todos',       dot: '' },
+    { id: 'steam',     label: 'Steam',       dot: '🔵' },
+    { id: 'epic',      label: 'Epic',        dot: '🟣' },
+    { id: 'gog',       label: 'GOG',         dot: '🟠' },
+    { id: 'local',     label: 'Local',       dot: '📁' },
+    { id: 'emulator',  label: 'Emuladores',  dot: '🕹' },
+    { id: 'favorites', label: 'Favoritos',   dot: '⭐' },
+  ];
+
+  // Count ignores search query so tabs don't disappear while typing
+  sources.forEach(({ id, label, dot }) => {
+    const count = id === 'all'
+      ? allGames.filter(g => !hiddenGames.has(g.id)).length
+      : id === 'favorites'
+        ? allGames.filter(g => favorites.has(g.id) && !hiddenGames.has(g.id)).length
+        : allGames.filter(g => g.source === id && !hiddenGames.has(g.id)).length;
+    if (count === 0) return;
+
+    const btn = document.createElement('button');
+    btn.className = 'bp-tab' + (bpTab === id ? ' active' : '');
+    btn.innerHTML = (dot ? dot + ' ' : '') + label + ` <span style="opacity:.5;font-size:11px">${count}</span>`;
+    btn.onclick = () => {
+      bpTab = id;
+      container.querySelectorAll('.bp-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      bpRenderGrid();
+      bpFocus(0);
+    };
+    container.appendChild(btn);
+  });
+}
+
+function bpRenderGrid() {
+  bpGames = getBpGames();
+  const grid = document.getElementById('bp-grid');
+  grid.innerHTML = '';
+  bpGames.forEach((g, i) => {
+    const card = document.createElement('div');
+    card.className = 'bp-card';
+    card.dataset.idx = i;
+    card.id = 'bp-card-' + i;
+
+    const cover = genreData[g.id]?.localImage || genreData[g.id]?.header || gameHeader(g);
+    const imgWrap = document.createElement('div');
+    imgWrap.className = 'bp-card-img-wrap';
+
+    const img = document.createElement('img');
+    img.src = cover; img.alt = '';
+    img.className = 'bp-card-img';
+
+    const fallback = document.createElement('div');
+    fallback.className = 'bp-card-fallback';
+    fallback.textContent = '🎮';
+    fallback.style.display = 'none';
+
+    img.addEventListener('error', () => { img.style.display='none'; fallback.style.display='flex'; });
+    imgWrap.appendChild(img);
+    imgWrap.appendChild(fallback);
+
+    const name = document.createElement('div');
+    name.className = 'bp-card-name';
+    name.textContent = g.name;
+
+    card.appendChild(imgWrap);
+    card.appendChild(name);
+    card.addEventListener('click', () => { bpFocus(i); });
+    card.addEventListener('dblclick', () => { launchGame(g.id); });
+    grid.appendChild(card);
+  });
+}
+
+function bpFocus(idx) {
+  if (!bpGames.length) { bpClearFocused(); return; }
+  bpFocusIdx = Math.max(0, Math.min(idx, bpGames.length - 1));
+
+  // Update card highlight
+  document.querySelectorAll('.bp-card').forEach((c, i) => {
+    c.classList.toggle('bp-focused', i === bpFocusIdx);
+  });
+
+  // Scroll focused card into view
+  const focusedCard = document.getElementById('bp-card-' + bpFocusIdx);
+  if (focusedCard) focusedCard.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+
+  // Update bottom bar
+  const g = bpGames[bpFocusIdx];
+  if (!g) return;
+
+  const cover = genreData[g.id]?.localImage || genreData[g.id]?.header || gameHeader(g);
+  const coverEl = document.getElementById('bp-focused-cover');
+  coverEl.style.backgroundImage = `url('${cover}')`;
+
+  document.getElementById('bp-focused-name').textContent = g.name;
+
+  const installed = isInstalled(g);
+  document.getElementById('bp-focused-meta').textContent =
+    (g.playtime ? fmtTime(g.playtime) + ' jogados · ' : '') +
+    (installed ? '✅ Instalado' : '☁️ Não instalado') +
+    ' · ' + g.source.toUpperCase();
+
+  const actionsEl = document.getElementById('bp-focused-actions');
+  actionsEl.innerHTML = '';
+
+  const playBtn = document.createElement('button');
+  playBtn.className = 'bp-action-btn bp-action-play';
+  playBtn.textContent = installed ? '▶  JOGAR' : '⬇  INSTALAR';
+  playBtn.onclick = () => launchGame(g.id);
+  actionsEl.appendChild(playBtn);
+
+  const detailBtn = document.createElement('button');
+  detailBtn.className = 'bp-action-btn';
+  detailBtn.textContent = '📋  DETALHES';
+  detailBtn.onclick = () => { openModal(g.id); };
+  actionsEl.appendChild(detailBtn);
+}
+
+function bpClearFocused() {
+  document.getElementById('bp-focused-cover').style.backgroundImage = '';
+  document.getElementById('bp-focused-name').textContent = '';
+  document.getElementById('bp-focused-meta').textContent = '';
+  document.getElementById('bp-focused-actions').innerHTML = '';
+}
+
+function bpKeyHandler(e) {
+  if (!bpActive) return;
+  const COLS = Math.floor(document.getElementById('bp-grid').offsetWidth / 200) || 6;
+  switch (e.key) {
+    case 'Escape':
+      e.preventDefault();
+      closeBigPicture();
+      break;
+    case 'ArrowRight':
+      e.preventDefault();
+      bpFocus(bpFocusIdx + 1);
+      break;
+    case 'ArrowLeft':
+      e.preventDefault();
+      bpFocus(bpFocusIdx - 1);
+      break;
+    case 'ArrowDown':
+      e.preventDefault();
+      bpFocus(bpFocusIdx + COLS);
+      break;
+    case 'ArrowUp':
+      e.preventDefault();
+      bpFocus(bpFocusIdx - COLS);
+      break;
+    case 'Enter':
+      e.preventDefault();
+      if (bpGames[bpFocusIdx]) launchGame(bpGames[bpFocusIdx].id);
+      break;
+    case 'F11':
+      e.preventDefault();
+      closeBigPicture();
+      break;
+    default:
+      // Start typing → focus search
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+        const search = document.getElementById('bp-search');
+        search.focus();
+      }
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

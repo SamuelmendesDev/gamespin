@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, Menu } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, shell, dialog, Menu } = require('electron');
 
 const path  = require('path');
 const fs    = require('fs');
@@ -72,6 +72,15 @@ function createWindow() {
   win.loadFile(path.join(__dirname, 'index.html'));
 }
 
+// IPC: toggle fullscreen / Big Picture mode
+ipcMain.handle('toggle-fullscreen', () => {
+  if (!win) return false;
+  const going = !win.isFullScreen();
+  win.setFullScreen(going);
+  return going;
+});
+ipcMain.handle('get-fullscreen', () => win?.isFullScreen() ?? false);
+
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   createWindow();
@@ -83,36 +92,60 @@ app.whenReady().then(() => {
   if (app.isPackaged) {
     try {
       const { autoUpdater } = require('electron-updater');
-      autoUpdater.autoDownload = true;
+      autoUpdater.autoDownload    = false; // we control download manually
       autoUpdater.autoInstallOnAppQuit = true;
-
-      autoUpdater.on('update-available', (info) => {
-        win?.webContents.send('update-available', info.version);
-      });
-
-      autoUpdater.on('update-downloaded', () => {
-        win?.webContents.send('update-downloaded');
-      });
 
       autoUpdater.logger = require('electron-log');
       autoUpdater.logger.transports.file.level = 'info';
 
-      autoUpdater.on('checking-for-update', () => console.log('[Updater] Checking...'));
+      autoUpdater.on('checking-for-update',  () => console.log('[Updater] Checking...'));
       autoUpdater.on('update-not-available', () => console.log('[Updater] Up to date'));
-      autoUpdater.on('error', (err) => console.log('[Updater] Error:', err.message));
+      autoUpdater.on('error', (err)          => console.log('[Updater] Error:', err.message));
 
-      // Check every 4 hours
+      autoUpdater.on('update-available', (info) => {
+        console.log(`[Updater] Update available: v${info.version}`);
+        win?.webContents.send('update-available', {
+          version:      info.version,
+          releaseNotes: info.releaseNotes || '',
+          releaseDate:  info.releaseDate  || ''
+        });
+      });
+
+      autoUpdater.on('download-progress', (progress) => {
+        win?.webContents.send('update-progress', {
+          percent:        Math.round(progress.percent),
+          transferred:    progress.transferred,
+          total:          progress.total,
+          bytesPerSecond: progress.bytesPerSecond
+        });
+      });
+
+      autoUpdater.on('update-downloaded', (info) => {
+        win?.webContents.send('update-downloaded', { version: info.version });
+      });
+
+      // Check on launch, then every 4 hours
       autoUpdater.checkForUpdates().catch(e => console.log('[Updater] Check failed:', e.message));
       setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 60 * 60 * 1000);
     } catch(e) { console.log('[Updater] Not available:', e.message); }
   }
 });
+
+ipcMain.handle('update-download', () => {
+  try {
+    const { autoUpdater } = require('electron-updater');
+    autoUpdater.downloadUpdate();
+  } catch {}
+});
+
 ipcMain.handle('install-update', () => {
   try {
     const { autoUpdater } = require('electron-updater');
     autoUpdater.quitAndInstall();
   } catch {}
 });
+
+
 
 app.on('window-all-closed', () => {
   // Only quit when the main window closes, not auth popups
@@ -735,6 +768,84 @@ ipcMain.handle('local-library-fetch-covers', async (_, gamesList) => {
   console.log(`[LocalScan] Covers fetched: ${Object.keys(results).length}/${gamesList.length}`);
   return results;
 });
+
+
+//  Emulators 
+// emulators.json: [ { id, name, exePath, extensions: ['nes','sfc',...], platform } ]
+// emulator_games.json: [ { id, name, emulatorId, romPath, coverPath, addedAt } ]
+const EMULATORS_FILE      = path.join(app.getPath('userData'), 'emulators.json');
+const EMULATOR_GAMES_FILE = path.join(app.getPath('userData'), 'emulator_games.json');
+
+function loadEmulators()      { try { return JSON.parse(fs.readFileSync(EMULATORS_FILE,      'utf8')); } catch { return []; } }
+function saveEmulators(arr)   { try { fs.writeFileSync(EMULATORS_FILE,      JSON.stringify(arr, null, 2)); } catch {} }
+function loadEmulatorGames()  { try { return JSON.parse(fs.readFileSync(EMULATOR_GAMES_FILE, 'utf8')); } catch { return []; } }
+function saveEmulatorGames(a) { try { fs.writeFileSync(EMULATOR_GAMES_FILE, JSON.stringify(a,   null, 2)); } catch {} }
+
+ipcMain.handle('emulators-get',       ()        => loadEmulators());
+ipcMain.handle('emulators-save',      (_, arr)  => { saveEmulators(arr); return true; });
+ipcMain.handle('emulator-games-get',  ()        => loadEmulatorGames());
+ipcMain.handle('emulator-games-save', (_, arr)  => { saveEmulatorGames(arr); return true; });
+
+ipcMain.handle('emulators-pick-exe', async (event) => {
+  const senderWin = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione o executável do emulador',
+    properties: ['openFile'],
+    filters: [{ name: 'Executável', extensions: ['exe','bat','cmd','sh','app'] }]
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('emulator-scan-roms', async (event, { extensions }) => {
+  const senderWin = BrowserWindow.fromWebContents(event.sender);
+  const dirResult = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione a pasta de ROMs',
+    properties: ['openDirectory']
+  });
+  if (dirResult.canceled || !dirResult.filePaths.length) return null;
+  const rootDir = dirResult.filePaths[0];
+
+  const extSet = new Set((extensions || []).map(e => e.toLowerCase().replace(/^\./, '')));
+  const found  = [];
+
+  function scan(dir, depth) {
+    if (depth > 4) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        scan(path.join(dir, entry.name), depth + 1);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).slice(1).toLowerCase();
+        if (!extSet.size || extSet.has(ext)) {
+          const romPath = path.join(dir, entry.name);
+          const name = path.basename(entry.name, path.extname(entry.name))
+            .replace(/\s*\(.*?\)/g, '').replace(/\s*\[.*?\]/g, '').trim();
+          found.push({ name, romPath, ext });
+        }
+      }
+    }
+  }
+  scan(rootDir, 0);
+  console.log(`[EmuScan] Found ${found.length} ROMs in ${rootDir}`);
+  return { rootDir, roms: found };
+});
+
+ipcMain.handle('emulator-launch', (_, { emulatorId, romPath }) => {
+  const emulators = loadEmulators();
+  const emu = emulators.find(e => e.id === emulatorId);
+  if (!emu) return false;
+  const { execFile } = require('child_process');
+  try {
+    execFile(emu.exePath, [romPath], { detached: true });
+    return true;
+  } catch(e) {
+    console.error('[EmuLaunch]', e.message);
+    return false;
+  }
+});
+
 
 
 //  Epic Games 

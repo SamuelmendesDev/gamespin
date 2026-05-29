@@ -100,6 +100,10 @@
     </div>
 
     <div class="sidebar-bottom">
+      <button class="sidebar-btn" id="btn-bigpicture" title="Modo Big Picture (F11)">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+        Big Picture
+      </button>
       <button class="sidebar-btn" id="btn-open-settings">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94zM12,15.6c-1.98,0-3.6-1.62-3.6-3.6s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>
         Configurações
@@ -124,6 +128,9 @@
       </button>
       <button class="tab" data-tab="local">
         <span class="tab-dot local-dot"></span> Local
+      </button>
+      <button class="tab" data-tab="emulator">
+        <span class="tab-dot emu-dot"></span> Emuladores
       </button>
       <button class="tab" data-tab="favorites">
         <span style="font-size:12px">⭐</span> Favoritos
@@ -323,17 +330,31 @@
           <span class="source-badge local-badge">LOCAL</span>
         </div>
         <p class="settings-desc">Adicione jogos instalados no seu PC que não pertencem a nenhuma loja.</p>
-        <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+        <div class="settings-btn-row">
           <button class="btn-primary" id="btn-add-local-game">+ Adicionar Jogo Local</button>
-          <button class="btn-ghost" id="btn-scan-local-dir">📁 Escanear Pasta</button>
+          <button class="btn-ghost settings-cache-btn" id="btn-scan-local-dir">📁 Escanear Pasta</button>
+        </div>
+      </div>
+
+      <!-- Emulators section -->
+      <div class="settings-section">
+        <div class="settings-section-title">
+          <span class="source-badge emu-badge">EMULADORES</span>
+        </div>
+        <p class="settings-desc">Configure emuladores e escaneie pastas de ROMs automaticamente.</p>
+        <div class="settings-btn-row">
+          <button class="btn-primary" id="btn-open-emu-manager">🕹 Gerenciar Emuladores</button>
         </div>
       </div>
 
       <!-- Theme section -->
       <div class="settings-section">
         <div class="settings-section-title">APARÊNCIA</div>
-        <div style="display:flex;align-items:center;justify-content:space-between">
-          <span style="font-size:13px;color:var(--muted)">Tema claro</span>
+        <div class="settings-toggle-row">
+          <div class="settings-toggle-info">
+            <span class="settings-toggle-label">Tema claro</span>
+            <span class="settings-toggle-desc">Alterna entre o modo escuro e claro</span>
+          </div>
           <button class="theme-toggle" id="btn-theme-toggle">
             <span id="theme-icon">☀️</span>
           </button>
@@ -343,10 +364,20 @@
       <!-- Cache section -->
       <div class="settings-section" id="cfg-cache-section" style="display:none">
         <div class="settings-section-title">CACHE</div>
-        <p class="settings-desc" id="cfg-cache-info"></p>
-        <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap">
-          <button class="btn-ghost" id="btn-clear-library-cache">Limpar biblioteca</button>
-          <button class="btn-ghost" id="btn-clear-genre-cache">Limpar gêneros</button>
+        <div class="settings-cache-card">
+          <div class="settings-cache-icon">🗃</div>
+          <div class="settings-cache-info">
+            <div class="settings-cache-label" id="cfg-cache-info">—</div>
+            <div class="settings-cache-sub">Dados de biblioteca e gêneros em cache local</div>
+          </div>
+        </div>
+        <div class="settings-cache-btns">
+          <button class="btn-ghost settings-cache-btn" id="btn-clear-library-cache">
+            <span>🗑</span> Limpar biblioteca
+          </button>
+          <button class="btn-ghost settings-cache-btn" id="btn-clear-genre-cache">
+            <span>🎭</span> Limpar gêneros
+          </button>
         </div>
       </div>
 
@@ -357,6 +388,32 @@
 <!-- ── MODAL ──────────────────────────────────────────────────────── -->
 <div id="modal-overlay" class="modal-overlay">
   <div class="modal-box" id="modal-box"></div>
+</div>
+
+
+<!-- ── BIG PICTURE MODE ────────────────────────────────────────────── -->
+<div id="bp-overlay" style="display:none">
+  <div id="bp-bg"></div>
+  <div id="bp-header">
+    <div id="bp-logo">🎮 <span>GAME<em>SPIN</em></span></div>
+    <div id="bp-clock" class="bp-clock"></div>
+    <button id="bp-exit-btn" title="Sair (ESC)">✕ Sair</button>
+  </div>
+  <div id="bp-search-wrap">
+    <input id="bp-search" type="text" placeholder="🔍  Buscar jogo…" autocomplete="off" spellcheck="false">
+  </div>
+  <div id="bp-tabs"></div>
+  <div id="bp-grid-wrap">
+    <div id="bp-grid"></div>
+  </div>
+  <div id="bp-focused-bar">
+    <div id="bp-focused-cover"></div>
+    <div id="bp-focused-info">
+      <div id="bp-focused-name"></div>
+      <div id="bp-focused-meta"></div>
+      <div id="bp-focused-actions"></div>
+    </div>
+  </div>
 </div>
 
 <script src="app.js"></script>
