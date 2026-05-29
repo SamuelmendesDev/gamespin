@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https: data: file:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; connect-src https:;">
+<title>GameSpin</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!-- ── SPLASH ─────────────────────────────────────────────────────── -->
+<div id="splash" class="splash">
+  <div class="splash-inner">
+    <div class="splash-logo">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12c0 3.69 1.99 6.93 4.96 8.7L10 14.55V14a2 2 0 0 1 2-2 2 2 0 0 1 2 2 2 2 0 0 1-2 2l-.55.02-2.84 4.46C9.61 21.9 10.78 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2z"/></svg>
+    </div>
+    <div class="splash-title">GAME<em>SPIN</em></div>
+    <div class="splash-subtitle" id="splash-subtitle">Iniciando…</div>
+    <div class="splash-bar-wrap">
+      <div class="splash-bar" id="splash-bar"></div>
+    </div>
+  </div>
+</div>
+
+<div id="app" class="app" style="display:none">
+
+  <!-- ── SIDEBAR ─────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="sidebar-top">
+
+      <div class="app-logo">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12c0 3.69 1.99 6.93 4.96 8.7L10 14.55V14a2 2 0 0 1 2-2 2 2 0 0 1 2 2 2 2 0 0 1-2 2l-.55.02-2.84 4.46C9.61 21.9 10.78 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2z"/></svg>
+        <span>GAME<em>SPIN</em></span>
+      </div>
+
+      <!-- Accounts summary -->
+      <div class="accounts-summary" id="accounts-summary">
+        <div class="account-row" id="steam-account-row" style="display:none">
+          <div class="account-dot steam-dot"></div>
+          <img id="sidebar-steam-avatar" src="" alt="" class="account-mini-avatar">
+          <span id="sidebar-steam-name" class="account-mini-name"></span>
+        </div>
+        <div class="account-row" id="epic-account-row" style="display:none">
+          <div class="account-dot epic-dot"></div>
+          <span class="account-mini-icon">🎮</span>
+          <span id="sidebar-epic-name" class="account-mini-name"></span>
+        </div>
+        <div class="no-accounts" id="no-accounts">
+          <p>Nenhuma conta conectada</p>
+          <button class="btn-connect-sidebar" id="btn-open-settings-connect">Conectar conta</button>
+        </div>
+      </div>
+
+      <!-- Random button -->
+      <div class="random-panel" id="random-panel" style="display:none">
+        <button class="random-btn" id="random-btn">
+          <span>🎲</span><span>SORTEAR</span>
+        </button>
+        <p class="random-sub" id="random-sub">da biblioteca toda</p>
+      </div>
+
+      <!-- Genre filters -->
+      <div class="genre-section" id="genre-section" style="display:none">
+        <div class="genre-header">
+          <span class="section-label-sm">GÊNEROS</span>
+          <button class="btn-tiny" id="btn-clear-genres">Limpar</button>
+        </div>
+        <div id="genre-progress-wrap" style="display:none">
+          <div class="progress-bg"><div class="progress-fill" id="progress-fill"></div></div>
+          <span class="progress-lbl" id="progress-lbl">0 / 0</span>
+        </div>
+        <div class="genre-chips" id="genre-chips"></div>
+        <span class="status-pill" id="genre-status" style="display:none"></span>
+      </div>
+
+    </div>
+
+    <div class="sidebar-bottom">
+      <button class="sidebar-btn" id="btn-open-settings">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94zM12,15.6c-1.98,0-3.6-1.62-3.6-3.6s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>
+        Configurações
+      </button>
+    </div>
+  </aside>
+
+  <!-- ── CONTENT ──────────────────────────────────────────────────── -->
+  <div class="content">
+
+    <!-- Tabs -->
+    <div class="tabs-bar" id="tabs-bar" style="display:none">
+      <button class="tab active" data-tab="all">Todos</button>
+      <button class="tab" data-tab="steam">
+        <span class="tab-dot steam-dot"></span> Steam
+      </button>
+      <button class="tab" data-tab="epic">
+        <span class="tab-dot epic-dot"></span> Epic
+      </button>
+      <button class="tab" data-tab="gog">
+        <span class="tab-dot gog-dot"></span> GOG
+      </button>
+      <button class="tab" data-tab="favorites">
+        <span style="font-size:12px">⭐</span> Favoritos
+      </button>
+      <button class="tab" data-tab="hidden" style="display:none">
+        <span style="font-size:12px">🚫</span> Ocultos <span class="hidden-count" style="font-size:10px;opacity:.6;margin-left:2px"></span>
+      </button>
+    </div>
+
+    <!-- Global loading progress bar -->
+    <div id="global-progress" style="display:none">
+      <div class="global-progress-bar">
+        <div class="global-progress-fill" id="global-progress-fill"></div>
+      </div>
+      <div class="global-progress-info">
+        <span id="global-progress-text">Carregando…</span>
+        <span id="global-progress-pct"></span>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="toolbar" id="toolbar" style="display:none">
+      <input type="text" id="search-input" class="search-box" placeholder="🔍  Buscar jogo…">
+      <select id="sort-select" class="sort-box">
+        <option value="playtime">Mais jogados</option>
+        <option value="name">Nome A–Z</option>
+        <option value="recent">Recentes</option>
+        <option value="unplayed">Nunca jogados</option>
+        <option value="installed">Instalados</option>
+        <option value="favorites">Favoritos</option>
+      </select>
+      <div class="toolbar-right">
+        <span id="results-label" class="results-lbl"></span>
+        <button class="btn-ghost small" id="btn-refresh" title="Atualizar">↻</button>
+      </div>
+    </div>
+
+    <!-- Scrollable -->
+    <div class="content-scroll" id="content-scroll">
+
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">🎮</div>
+        <h2>BEM-VINDO AO GAMESPIN</h2>
+        <p>Conecte sua conta Steam e/ou Epic Games para ver sua biblioteca unificada.</p>
+        <button class="btn-primary" id="btn-empty-connect">Conectar conta</button>
+      </div>
+
+      <div id="featured-wrap" style="display:none">
+        <div class="featured-card" id="featured-card"></div>
+      </div>
+
+      <div class="games-grid" id="games-grid"></div>
+      <div id="load-more-wrap" style="display:none; text-align:center; padding:24px 0">
+        <button class="btn-ghost" id="btn-load-more">Carregar mais</button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── SETTINGS PANEL ─────────────────────────────────────────────── -->
+<div class="settings-overlay" id="settings-overlay">
+  <div class="settings-panel">
+
+    <div class="settings-header">
+      <span class="settings-title">CONFIGURAÇÕES</span>
+      <button class="settings-close" id="btn-close-settings">✕</button>
+    </div>
+
+    <div class="settings-body">
+
+      <!-- Steam section -->
+      <div class="settings-section">
+        <div class="settings-section-title">
+          <span class="source-badge steam-badge">STEAM</span>
+        </div>
+        <div id="cfg-steam-connected" style="display:none">
+          <div class="cfg-account-card">
+            <img id="cfg-steam-avatar" src="" alt="">
+            <div>
+              <div id="cfg-steam-name" class="cfg-account-name"></div>
+              <div id="cfg-steam-info" class="cfg-account-info"></div>
+            </div>
+            <button class="btn-danger-sm" id="btn-steam-disconnect">Desconectar</button>
+          </div>
+        </div>
+        <div id="cfg-steam-disconnected">
+          <p class="settings-desc">Faça login para detectar seu Steam ID automaticamente.</p>
+          <button class="btn-steam-login" id="btn-steam-login">
+            <svg viewBox="0 0 24 24" fill="currentColor" style="width:16px;height:16px"><path d="M12 2C6.48 2 2 6.48 2 12c0 3.69 1.99 6.93 4.96 8.7L10 14.55V14a2 2 0 0 1 2-2 2 2 0 0 1 2 2 2 2 0 0 1-2 2l-.55.02-2.84 4.46C9.61 21.9 10.78 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2z"/></svg>
+            DETECTAR STEAM ID
+          </button>
+          <div class="field" style="margin-top:14px">
+            <label>Steam API Key</label>
+            <input type="password" id="cfg-key" placeholder="A3B2C1D4E5F6…" autocomplete="off">
+            <span class="hint">Obtenha em <span class="link" id="link-apikey">steamcommunity.com/dev/apikey</span></span>
+          </div>
+          <div class="field">
+            <label>Steam ID (64-bit)</label>
+            <input type="text" id="cfg-steamid" placeholder="Preenchido automaticamente…">
+            <span class="hint">Ou descubra em <span class="link" id="link-steamid">steamid.io</span></span>
+          </div>
+          <button class="btn-primary" id="btn-steam-connect">CONECTAR</button>
+          <div class="banner error" id="cfg-steam-error" style="display:none"></div>
+        </div>
+      </div>
+
+      <!-- Steam path section -->
+      <div class="settings-section" id="cfg-path-section" style="display:none">
+        <div class="settings-section-title">PASTA DO STEAM</div>
+        <div class="field">
+          <div class="path-row">
+            <input type="text" id="cfg-path" placeholder="C:\Program Files (x86)\Steam">
+            <button class="btn-ghost" id="btn-detect">Detectar</button>
+          </div>
+          <span class="hint" id="path-hint">Para detectar jogos instalados</span>
+        </div>
+        <button class="btn-ghost" id="btn-save-path">Salvar caminho</button>
+      </div>
+
+      <!-- Epic section -->
+      <div class="settings-section">
+        <div class="settings-section-title">
+          <span class="source-badge epic-badge">EPIC GAMES</span>
+        </div>
+        <div id="cfg-epic-connected" style="display:none">
+          <div class="cfg-account-card">
+            <div class="epic-avatar-placeholder">E</div>
+            <div>
+              <div id="cfg-epic-name" class="cfg-account-name"></div>
+              <div id="cfg-epic-info" class="cfg-account-info"></div>
+            </div>
+            <button class="btn-danger-sm" id="btn-epic-disconnect">Desconectar</button>
+          </div>
+        </div>
+        <div id="cfg-epic-disconnected">
+          <p class="settings-desc">Faça login com sua conta Epic Games para importar sua biblioteca.</p>
+          <button class="btn-epic-connect" id="btn-epic-auth">
+            <span>🎮</span> ENTRAR COM EPIC GAMES
+          </button>
+          <div class="epic-code-section" id="epic-code-section" style="display:none">
+            <p class="settings-desc" style="margin-bottom:8px">
+              Após fazer login, a página mostrará um JSON. Cole ele inteiro abaixo — o app extrai o código automaticamente.
+            </p>
+            <div class="field">
+              <label>Código / JSON da Epic</label>
+              <input type="text" id="cfg-epic-code" placeholder='Cole o JSON ou só o "authorizationCode"…' autocomplete="off">
+            </div>
+            <button class="btn-primary" id="btn-epic-exchange">CONFIRMAR</button>
+            <div class="banner error" id="cfg-epic-error" style="display:none"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- GOG section -->
+      <div class="settings-section">
+        <div class="settings-section-title">
+          <span class="source-badge gog-badge">GOG</span>
+        </div>
+        <div id="cfg-gog-connected" style="display:none">
+          <div class="cfg-account-card">
+            <div class="gog-avatar-placeholder">G</div>
+            <div>
+              <div id="cfg-gog-name" class="cfg-account-name"></div>
+              <div id="cfg-gog-info" class="cfg-account-info"></div>
+            </div>
+            <button class="btn-danger-sm" id="btn-gog-disconnect">Desconectar</button>
+          </div>
+        </div>
+        <div id="cfg-gog-disconnected">
+          <p class="settings-desc">Uma janela de login vai abrir — faça login e ela fecha automaticamente.</p>
+          <button class="btn-gog-connect" id="btn-gog-auth">
+            <span>🎮</span> ENTRAR COM GOG
+          </button>
+          <div class="banner error" id="cfg-gog-error" style="display:none"></div>
+          <!-- Manual fallback -->
+          <div class="gog-code-section" id="gog-code-section" style="display:none">
+            <p class="settings-desc" style="margin-bottom:8px">Se a janela não fechou, cole o código manualmente:</p>
+            <div class="field">
+              <input type="text" id="cfg-gog-code" placeholder="Código da URL…" autocomplete="off">
+            </div>
+            <button class="btn-primary" id="btn-gog-exchange">CONFIRMAR</button>
+          </div>
+        </div>
+      </div>
+      <!-- Theme section -->
+      <div class="settings-section">
+        <div class="settings-section-title">APARÊNCIA</div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px;color:var(--muted)">Tema claro</span>
+          <button class="theme-toggle" id="btn-theme-toggle">
+            <span id="theme-icon">☀️</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Cache section -->
+      <div class="settings-section" id="cfg-cache-section" style="display:none">
+        <div class="settings-section-title">CACHE</div>
+        <p class="settings-desc" id="cfg-cache-info"></p>
+        <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap">
+          <button class="btn-ghost" id="btn-clear-library-cache">Limpar biblioteca</button>
+          <button class="btn-ghost" id="btn-clear-genre-cache">Limpar gêneros</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── MODAL ──────────────────────────────────────────────────────── -->
+<div id="modal-overlay" class="modal-overlay">
+  <div class="modal-box" id="modal-box"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

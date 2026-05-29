@@ -1,0 +1,70 @@
+{
+  "name": "gamespin",
+  "version": "1.0.0",
+  "description": "Unified game library launcher for Steam, Epic and GOG",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64",
+    "build:portable": "electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "howlongtobeat": "^1.8.0",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "productName": "GameSpin",
+  "build": {
+    "appId": "com.gamespin.app",
+    "productName": "GameSpin",
+    "copyright": "Copyright © 2025 GameSpin",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets/",
+        "to": "assets/",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "signingHashAlgorithms": []
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "installerIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "GameSpin"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/node-fetch/**",
+      "node_modules/howlongtobeat/**"
+    ],
+    "forceCodeSigning": false
+  },
+  "author": "GameSpin"
+}

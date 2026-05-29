@@ -1,0 +1,1656 @@
+const { app, BrowserWindow, ipcMain, shell, dialog, Menu } = require('electron');
+
+const path  = require('path');
+const fs    = require('fs');
+const fetch = require('node-fetch');
+
+//  Cache dir 
+const CACHE_DIR  = path.join(app.getPath('userData'), 'cache');
+const CONFIG_FILE = path.join(app.getPath('userData'), 'config.json');
+const CACHE_TTL  = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+//  Bulk app-details cache (single file, much faster than one-file-per-app) 
+const BULK_CACHE_FILE = path.join(app.getPath('userData'), 'appdetails_cache.json');
+
+function loadBulkCache() {
+  try {
+    if (!fs.existsSync(BULK_CACHE_FILE)) return {};
+    return JSON.parse(fs.readFileSync(BULK_CACHE_FILE, 'utf8'));
+  } catch { return {}; }
+}
+
+let _bulkCache = null;
+function getBulkCache() {
+  if (!_bulkCache) _bulkCache = loadBulkCache();
+  return _bulkCache;
+}
+
+function saveBulkCache() {
+  try { fs.writeFileSync(BULK_CACHE_FILE, JSON.stringify(_bulkCache)); } catch {}
+}
+
+function getBulkEntry(appid) {
+  return getBulkCache()[appid] || null;
+}
+
+function setBulkEntry(appid, data) {
+  getBulkCache()[appid] = data;
+  // Debounce disk write — save at most every 2 seconds
+  if (!setBulkEntry._timer) {
+    setBulkEntry._timer = setTimeout(() => {
+      saveBulkCache();
+      setBulkEntry._timer = null;
+    }, 1000);
+  }
+}
+
+
+
+//  Window 
+let win;
+function createWindow() {
+  win = new BrowserWindow({
+    width: 1280,
+    height: 820,
+    minWidth: 900,
+    minHeight: 600,
+    title: 'GameSpin',
+    backgroundColor: '#0b0d11',
+    titleBarStyle: 'default',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    },
+    icon: app.isPackaged
+      ? path.join(process.resourcesPath, 'assets', 'icon.png')
+      : path.join(__dirname, '../assets/icon.png')
+  });
+
+  win.loadFile(path.join(__dirname, 'index.html'));
+}
+
+app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
+  createWindow();
+  // Run migration after window is shown (non-blocking)
+  setImmediate(() => {
+    try { migrateGenreCache(); } catch(e) { console.error('[Migration]', e.message); }
+  });
+});
+app.on('window-all-closed', () => {
+  // Only quit when the main window closes, not auth popups
+  if (BrowserWindow.getAllWindows().length === 0) {
+    if (_bulkCache) saveBulkCache();
+    if (process.platform !== 'darwin') app.quit();
+  }
+});
+app.on('before-quit', () => { if (_bulkCache) saveBulkCache(); });
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+
+//  Cache helpers 
+function cacheFile(key) {
+  return path.join(CACHE_DIR, key.replace(/[^a-z0-9_-]/gi, '_') + '.json');
+}
+function readCache(key) {
+  try {
+    const f = cacheFile(key);
+    if (!fs.existsSync(f)) return null;
+    const { ts, data } = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (Date.now() - ts > CACHE_TTL) return null;
+    return data;
+  } catch { return null; }
+}
+function writeCache(key, data) {
+  try { fs.writeFileSync(cacheFile(key), JSON.stringify({ ts: Date.now(), data })); } catch {}
+}
+
+//  Config (API key, steamid, steam path) 
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
+}
+function saveConfig(cfg) {
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2)); } catch {}
+}
+
+//  Steam library detection 
+function findInstalledGames(steamPath) {
+  const installed = new Set();
+  try {
+    // Read libraryfolders.vdf to find all Steam library paths
+    const vdfPath = path.join(steamPath, 'steamapps', 'libraryfolders.vdf');
+    const vdf = fs.readFileSync(vdfPath, 'utf8');
+
+    // Extract all library paths from VDF
+    const libraryPaths = [path.join(steamPath, 'steamapps')];
+    const pathMatches = [...vdf.matchAll(/"path"\s+"([^"]+)"/gi)];
+    for (const m of pathMatches) {
+      libraryPaths.push(path.join(m[1].replace(/\\\\/g, '\\'), 'steamapps'));
+    }
+
+    // Scan each library for appmanifest_*.acf files
+    for (const libPath of libraryPaths) {
+      if (!fs.existsSync(libPath)) continue;
+      const files = fs.readdirSync(libPath);
+      for (const f of files) {
+        const match = f.match(/^appmanifest_(\d+)\.acf$/);
+        if (match) installed.add(parseInt(match[1]));
+      }
+    }
+  } catch {}
+  return installed;
+}
+
+function detectSteamPath() {
+  const candidates = [
+    'C:\\Program Files (x86)\\Steam',
+    'C:\\Program Files\\Steam',
+    process.env.HOME ? path.join(process.env.HOME, '.steam', 'steam') : '',
+    '/usr/share/steam'
+  ].filter(Boolean);
+
+  for (const p of candidates) {
+    if (fs.existsSync(path.join(p, 'steamapps'))) return p;
+  }
+  return null;
+}
+
+//  Steam Store API fetch with retry + JSON validation 
+async function fetchAppDetails(appid) {
+  const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&l=portuguese`;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res  = await fetch(url, { timeout: 10000 });
+      const text = await res.text();
+      if (!text.trim().startsWith('{')) {
+        await new Promise(r => setTimeout(r, 1500 * attempt));
+        continue;
+      }
+      const data = JSON.parse(text);
+      const info = data[appid];
+      if (!info?.success || !info.data) {
+        return { appid, name: '', description: '', genres: [], categories: [], screenshots: [], header: null, capsule: null };
+      }
+      const d = info.data;
+      const result = {
+        appid,
+        name:        d.name || '',
+        description: d.short_description || stripHtml(d.about_the_game || '') || '',
+        genres:      (d.genres     || []).map(g => g.description),
+        categories:  (d.categories || []).map(c => c.description),
+        header:      d.header_image || `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/header.jpg`,
+        capsule:     `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/library_600x900.jpg`,
+        screenshots: (d.screenshots || []).slice(0, 3).map(s => s.path_full || s.path_thumbnail)
+      };
+      setBulkEntry(appid, result);
+      return result;
+    } catch {
+      if (attempt === 4) break;
+      await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
+  }
+  return { appid, genres: [], description: '', header: null, capsule: null };
+}
+
+
+//  Genre normalization — translate English IGDB genres to Portuguese 
+const GENRE_TRANSLATE = {
+  'Action':'Ação', 'Adventure':'Aventura', 'Indie':'Indie', 'RPG':'RPG',
+  'Strategy':'Estratégia', 'Simulation':'Simulação', 'Sports':'Esportes',
+  'Racing':'Corridas', 'Puzzle':'Puzzle', 'Shooter':'Ação', 'Fighting':'Ação',
+  'Horror':'Aventura', 'Survival':'Aventura', 'Casual':'Casual',
+  'Platformer':'Plataforma', 'Card Game':'Card Game', 'Visual Novel':'Visual Novel',
+  'Platform':'Plataforma', 'RTS':'Estratégia', 'Turn-based Strategy':'Estratégia',
+  'Hack and Slash':'Ação', 'Tactical':'Estratégia', 'Arcade':'Ação',
+  'MOBA':'Ação', 'Point-and-click':'Aventura', 'Music':'Casual'
+};
+
+function normalizeGenres(genres) {
+  if (!genres?.length) return genres;
+  return [...new Set(genres.map(g => GENRE_TRANSLATE[g] || g))];
+}
+
+function migrateGenreCache() {
+  const cache = getBulkCache();
+  let changed = false;
+  for (const [key, entry] of Object.entries(cache)) {
+    if (!entry?.genres?.length) continue;
+    const normalized = normalizeGenres(entry.genres);
+    const different = normalized.some((g, i) => g !== entry.genres[i]) || normalized.length !== entry.genres.length;
+    if (different) {
+      cache[key].genres = normalized;
+      changed = true;
+    }
+  }
+  if (changed) {
+    saveBulkCache();
+    console.log('[Cache] Genre migration complete');
+  }
+}
+
+
+//  Steam OpenID Login 
+const STEAM_OPENID_URL = 'https://steamcommunity.com/openid/login?' + [
+  'openid.ns=http://specs.openid.net/auth/2.0',
+  'openid.mode=checkid_setup',
+  'openid.return_to=http://localhost:1337/steam/callback',
+  'openid.realm=http://localhost:1337',
+  'openid.identity=http://specs.openid.net/auth/2.0/identifier_select',
+  'openid.claimed_id=http://specs.openid.net/auth/2.0/identifier_select'
+].join('&');
+
+ipcMain.handle('steam-start-auth', async () => {
+  return new Promise((resolve) => {
+    const authWin = new BrowserWindow({
+      width: 560, height: 700,
+      title: 'Login Steam',
+      parent: win,
+      webPreferences: { nodeIntegration: false, contextIsolation: true }
+    });
+
+    let resolved = false;
+    const done = (result) => {
+      if (resolved) return;
+      resolved = true;
+      if (!authWin.isDestroyed()) authWin.destroy();
+      resolve(result);
+    };
+
+    const checkUrl = (url) => {
+      try {
+        if (url.includes('localhost:1337/steam/callback')) {
+          const u = new URL(url);
+          const identity = u.searchParams.get('openid.identity') || u.searchParams.get('openid.claimed_id') || '';
+          const match = identity.match(/\/(\d{17})$/);
+          if (match) { done({ ok: true, steamid: match[1] }); return; }
+        }
+        // Also check for claimed_id in the URL directly
+        const claimedMatch = url.match(/openid\.claimed_id=.*?\/(\d{17})/);
+        if (claimedMatch) { done({ ok: true, steamid: claimedMatch[1] }); }
+      } catch {}
+    };
+
+    authWin.loadURL(STEAM_OPENID_URL);
+    authWin.webContents.on('did-navigate', (_, url) => checkUrl(url));
+    authWin.webContents.on('did-redirect-navigation', (_, url) => checkUrl(url));
+    authWin.webContents.on('will-navigate', (_, url) => checkUrl(url));
+    authWin.on('closed', () => done({ ok: false, cancelled: true }));
+  });
+});
+
+//  IPC handlers 
+
+// Get/save config
+ipcMain.handle('get-config', () => loadConfig());
+ipcMain.handle('save-config', (_, cfg) => { saveConfig(cfg); return true; });
+
+// Browse for Steam folder
+ipcMain.handle('browse-steam-path', async (event) => {
+  const senderWin = BrowserWindow.fromWebContents(event.sender);
+  const defaultPath = fs.existsSync('C:\\Program Files (x86)\\Steam')
+    ? 'C:\\Program Files (x86)\\Steam'
+    : 'C:\\';
+  const result = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione a pasta de instalação do Steam',
+    properties: ['openDirectory'],
+    defaultPath
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  const selected = result.filePaths[0];
+  if (!fs.existsSync(path.join(selected, 'steamapps'))) {
+    return { error: 'Pasta inválida — não encontrei a subpasta "steamapps" aqui.' };
+  }
+  return { path: selected };
+});
+
+// Auto-detect Steam
+ipcMain.handle('detect-steam', () => {
+  const p = detectSteamPath();
+  return p ? { path: p } : { error: 'Steam não encontrado automaticamente.' };
+});
+
+// Fetch games library
+ipcMain.handle('get-games', async (_, { key, steamid }) => {
+  const cacheKey = `games_${steamid}`;
+  const cached = readCache(cacheKey);
+  if (cached) return { source: 'cache', games: cached };
+
+  // Try two endpoints — v1 is newer, v0001 is more reliable
+  const urls = [
+    `https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/?key=${key}&steamid=${steamid}&include_appinfo=1&include_played_free_games=1&format=json`,
+    `https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key=${key}&steamid=${steamid}&include_appinfo=true&include_played_free_games=true`
+  ];
+
+  let lastErr;
+  for (const url of urls) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res  = await fetch(url, { timeout: 45000 });
+        const text = await res.text();
+        if (!text.trim().startsWith('{')) throw new Error('Resposta inválida da Steam API');
+        const data = JSON.parse(text);
+        if (!data.response?.games) throw new Error('Biblioteca não encontrada. Verifique se o perfil está público e as credenciais estão corretas.');
+        const games = data.response.games.map(g => ({
+          appid: g.appid,
+          name:  g.name || `App ${g.appid}`,
+          playtime: g.playtime_forever || 0,
+          playtime_recent: g.playtime_2weeks || 0
+        }));
+        games.sort((a, b) => b.playtime - a.playtime);
+        writeCache(cacheKey, games);
+        return { source: 'api', games };
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 3) await new Promise(r => setTimeout(r, 1500 * attempt));
+      }
+    }
+  }
+  throw lastErr;
+});
+
+// Fetch player info
+ipcMain.handle('get-player', async (_, { key, steamid }) => {
+  const url  = `https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=${key}&steamids=${steamid}`;
+  const res  = await fetch(url, { timeout: 8000 });
+  const data = await res.json();
+  const p    = data.response?.players?.[0];
+  if (!p) throw new Error('Jogador não encontrado');
+  return { name: p.personaname, avatar: p.avatarfull || p.avatarmedium };
+});
+
+
+// Load all cached app details at once — reads single bulk file, very fast
+ipcMain.handle('get-cached-details', (_, appids) => {
+  const bulk = getBulkCache();
+  const results = {};
+  for (const appid of appids) {
+    // Works for both Steam appids (numbers) and Epic ids (epic_AppName strings)
+    if (bulk[appid]) {
+      results[appid] = bulk[appid];
+    } else if (!String(appid).startsWith('epic_')) {
+      // Only check per-file cache for Steam games
+      const old = readCache(`app_${appid}`);
+      if (old) {
+        results[appid] = old;
+        setBulkEntry(appid, old);
+      }
+    }
+  }
+  return results;
+});
+
+// Fetch app details (description + genres + screenshots)
+ipcMain.handle('get-appdetails', async (_, appid) => {
+  // Check bulk cache first (fast)
+  const bulk = getBulkEntry(appid);
+  if (bulk) return bulk;
+
+  const result = await fetchAppDetails(appid);
+  if (result.genres?.length || result.description) {
+    setBulkEntry(appid, result);
+  }
+  return result;
+});
+
+// Batch app details — parallel with concurrency limit (fast but safe)
+ipcMain.handle('get-appdetails-batch', async (_, appids) => {
+  const results = {};
+  const toFetch = [];
+
+  const bulk = getBulkCache();
+  for (const appid of appids) {
+    if (bulk[appid]) results[appid] = bulk[appid];
+    else toFetch.push(appid);
+  }
+
+  // Run up to 5 requests in parallel, with 200ms between batches
+  const CONCURRENCY = 5;
+  for (let i = 0; i < toFetch.length; i += CONCURRENCY) {
+    const chunk = toFetch.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(async appid => {
+      const result = await fetchAppDetails(appid);
+      results[appid] = result;
+      if (result.genres?.length || result.description) {
+        setBulkEntry(appid, result);
+      }
+    }));
+    if (i + CONCURRENCY < toFetch.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  return results;
+});
+
+// Get installed games list
+ipcMain.handle('get-installed', (_, steamPath) => {
+  const set = findInstalledGames(steamPath);
+  return [...set];
+});
+
+// Launch or install game
+ipcMain.handle('launch-game', (_, { appid, installed, url }) => {
+  if (url) {
+    shell.openExternal(url);
+  } else if (installed) {
+    shell.openExternal(`steam://rungameid/${appid}`);
+  } else {
+    shell.openExternal(`steam://install/${appid}`);
+  }
+  return true;
+});
+
+
+// Clear genre/appdetails cache
+ipcMain.handle('clear-genre-cache', () => {
+  try {
+    _bulkCache = {};
+    if (fs.existsSync(BULK_CACHE_FILE)) fs.unlinkSync(BULK_CACHE_FILE);
+    return true;
+  } catch { return false; }
+});
+
+// Clear cache for a steamid
+ipcMain.handle('clear-cache', (_, steamid) => {
+  try {
+    const f = cacheFile(`games_${steamid}`);
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+    return true;
+  } catch { return false; }
+});
+
+//  Util 
+function stripHtml(h) {
+  return h.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Pick local image for a game
+ipcMain.handle('pick-local-image', async (event) => {
+  const senderWin = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione uma imagem para o jogo',
+    properties: ['openFile'],
+    filters: [{ name: 'Imagens', extensions: ['jpg','jpeg','png','webp','gif'] }]
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  // Return as file:// URL so Electron renderer can load it
+  return 'file://' + result.filePaths[0].replace(/\\/g, '/');
+});
+
+
+//  Epic Games 
+const EPIC_TOKEN_FILE = path.join(app.getPath('userData'), 'epic_token.json');
+// Launcher client — used for auth + library listing
+const EPIC_CLIENT_ID     = '34a02cf8f4414e29b15921876da36f9a';
+const EPIC_CLIENT_SECRET = 'daafbccc737745039dffe53d94fc76cf';
+// Catalog client — has access to keyImages/metadata (same as Epic Games website)
+const EPIC_CATALOG_ID     = '9fc856b42c954c47829b2b65ee7b5c2b';
+const EPIC_CATALOG_SECRET = 'WUjFfLJBnZD2OsVGWfBNHaHVSJySSBNe';
+const EPIC_REDIRECT   = 'https://www.epicgames.com/id/api/redirect?clientId=34a02cf8f4414e29b15921876da36f9a&responseType=code';
+
+function loadEpicToken() {
+  try { return JSON.parse(fs.readFileSync(EPIC_TOKEN_FILE, 'utf8')); } catch { return null; }
+}
+function saveEpicToken(token) {
+  try { fs.writeFileSync(EPIC_TOKEN_FILE, JSON.stringify(token)); } catch {}
+}
+function clearEpicToken() {
+  try { if (fs.existsSync(EPIC_TOKEN_FILE)) fs.unlinkSync(EPIC_TOKEN_FILE); } catch {}
+}
+
+// Get a token using catalog client credentials (for keyImages access)
+let _catalogToken = null;
+let _catalogTokenExpiry = 0;
+async function getCatalogToken() {
+  if (_catalogToken && Date.now() < _catalogTokenExpiry - 60000) return _catalogToken;
+  try {
+    const res = await fetch('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from(`${EPIC_CATALOG_ID}:${EPIC_CATALOG_SECRET}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'grant_type=client_credentials',
+      timeout: 10000
+    });
+    const data = await res.json();
+    if (data.access_token) {
+      _catalogToken = data.access_token;
+      _catalogTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+      return _catalogToken;
+    }
+  } catch(e) { console.error('[Epic] Catalog token error:', e.message); }
+  return null;
+}
+
+async function refreshEpicToken(refreshToken) {
+  const res = await fetch('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(`${EPIC_CLIENT_ID}:${EPIC_CLIENT_SECRET}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: `grant_type=refresh_token&refresh_token=${refreshToken}`,
+    timeout: 15000
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Falha ao renovar token Epic');
+  return data;
+}
+
+async function getValidEpicToken() {
+  const stored = loadEpicToken();
+  if (!stored) return null;
+  // Check if access token is still valid (with 60s buffer)
+  if (stored.expires_at && Date.now() < stored.expires_at - 60000) {
+    return stored.access_token;
+  }
+  // Try refresh
+  if (stored.refresh_token) {
+    try {
+      const fresh = await refreshEpicToken(stored.refresh_token);
+      const newToken = {
+        access_token:  fresh.access_token,
+        refresh_token: fresh.refresh_token || stored.refresh_token,
+        account_id:    fresh.account_id || stored.account_id,
+        display_name:  fresh.displayName || stored.display_name,
+        expires_at:    Date.now() + (fresh.expires_in || 7200) * 1000
+      };
+      saveEpicToken(newToken);
+      return newToken.access_token;
+    } catch { clearEpicToken(); return null; }
+  }
+  return null;
+}
+
+// Read locally installed Epic games from manifest files
+function getEpicInstalledGames() {
+  const games = [];
+  const manifestDirs = [
+    'C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests',
+    path.join(process.env.PROGRAMDATA || 'C:\ProgramData', 'Epic', 'EpicGamesLauncher', 'Data', 'Manifests')
+  ];
+  const seen = new Set();
+  for (const dir of manifestDirs) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const files = fs.readdirSync(dir).filter(f => f.endsWith('.item'));
+      for (const file of files) {
+        try {
+          const data = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+          if (data.AppName && !seen.has(data.AppName)) {
+            seen.add(data.AppName);
+            games.push({
+              catalogItemId: data.CatalogItemId || data.AppName,
+              appName:       data.AppName,
+              name:          data.DisplayName || data.AppName,
+              installPath:   data.InstallLocation,
+              installed:     true
+            });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+  return games;
+}
+
+// IPC: start Epic OAuth flow — embedded browser captures code automatically
+const EPIC_LOGIN_URL = `https://www.epicgames.com/id/login?redirectUrl=${encodeURIComponent(EPIC_REDIRECT)}`;
+
+ipcMain.handle('epic-start-auth', async () => {
+  return new Promise((resolve) => {
+    const authWin = new BrowserWindow({
+      width: 560, height: 700,
+      title: 'Login Epic Games',
+      parent: win,
+      webPreferences: { nodeIntegration: false, contextIsolation: true }
+    });
+
+    let resolved = false;
+    const done = (result) => {
+      if (resolved) return;
+      resolved = true;
+      if (!authWin.isDestroyed()) authWin.destroy();
+      resolve(result);
+    };
+
+    const checkUrl = (url) => {
+      try {
+        // Epic redirects to epicgames.com/id/api/redirect with authorizationCode in JSON
+        if (url.includes('/id/api/redirect') || url.includes('authorizationCode')) {
+          // Fetch the page content to get the code
+          authWin.webContents.executeJavaScript('document.body.innerText')
+            .then(text => {
+              try {
+                const data = JSON.parse(text);
+                const code = data.authorizationCode || data.exchangeCode;
+                if (code) { done({ ok: true, code }); return; }
+              } catch {}
+            }).catch(() => {});
+        }
+      } catch {}
+    };
+
+    authWin.loadURL(EPIC_LOGIN_URL);
+    authWin.webContents.on('did-navigate', (_, url) => checkUrl(url));
+    authWin.webContents.on('did-redirect-navigation', (_, url) => checkUrl(url));
+    authWin.on('closed', () => done({ ok: false, cancelled: true }));
+  });
+});
+
+// IPC: exchange authorization code for token
+ipcMain.handle('epic-exchange-code', async (_, code) => {
+  const res = await fetch('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(`${EPIC_CLIENT_ID}:${EPIC_CLIENT_SECRET}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: `grant_type=authorization_code&code=${code}`,
+    timeout: 15000
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error(data.errorMessage || 'Código inválido');
+
+  const token = {
+    access_token:  data.access_token,
+    refresh_token: data.refresh_token,
+    account_id:    data.account_id,
+    display_name:  data.displayName,
+    expires_at:    Date.now() + (data.expires_in || 7200) * 1000
+  };
+  saveEpicToken(token);
+  return { ok: true, displayName: token.display_name };
+});
+
+// IPC: get Epic library
+ipcMain.handle('epic-get-library', async () => {
+  const accessToken = await getValidEpicToken();
+  if (!accessToken) return { error: 'not_authenticated' };
+
+  const stored     = loadEpicToken();
+  const accountId  = stored.account_id;
+
+  // Always read locally installed games first
+  const installedLocal = getEpicInstalledGames();
+  const installedMap   = {};
+  installedLocal.forEach(g => { installedMap[g.appName] = g; });
+
+  let games = [];
+
+  //  library-service REST API (paginated) 
+  if (games.length === 0) {
+    try {
+      console.log('[Epic] Trying library-service (paginated)...');
+      const seen = new Set();
+      let cursor = '';
+      let page   = 0;
+
+      while (true) {
+        const url = `https://library-service.live.use1a.on.epicgames.com/library/api/public/items?includeMetadata=true${cursor ? '&cursor=' + cursor : ''}`;
+        const res = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'User-Agent': 'EpicGamesLauncher/15.0.0'
+          },
+          timeout: 20000
+        });
+        if (!res.ok) { console.log('[Epic] library-service status:', res.status); break; }
+
+        const data    = await res.json();
+        const records = data.records || [];
+        console.log(`[Epic] library-service page ${page}: ${records.length} records`);
+        for (const r of records) {
+          const appName = r.appName || r.catalogItemId;
+          if (!appName || seen.has(appName)) continue;
+          // Skip non-game records (DLC, addons, etc)
+          if (r.recordType && r.recordType !== 'APPLICATION') continue;
+          // Skip entries that look like DLC/addons by appName pattern
+          // Main games usually have short appNames; skip entries where the same
+          // sandboxName (game title) already exists from a different namespace
+          const name = r.sandboxName || installedMap[appName]?.name || appName;
+          seen.add(appName);
+
+          // Dedup by sandboxName — keep only one entry per game title
+          // Prefer the one that matches an installed game, or the first seen
+          const existingIdx = games.findIndex(g => g.name === name);
+          if (existingIdx !== -1) {
+            // If this one is installed and existing is not, replace it
+            if (installedMap[appName] && !games[existingIdx].installed) {
+              games[existingIdx] = {
+                id: 'epic_' + appName, appName, name, source: 'epic',
+                installed: true, playtime: 0,
+                namespace: r.namespace, catalogItemId: r.catalogItemId, header: null
+              };
+            }
+            continue;
+          }
+
+          games.push({
+            id:            'epic_' + appName,
+            appName,
+            name,
+            source:        'epic',
+            installed:     !!installedMap[appName],
+            playtime:      0,
+            namespace:     r.namespace,
+            catalogItemId: r.catalogItemId,
+            header:        null
+          });
+        }
+
+        // Check for next page
+        cursor = data.responseMetadata?.nextCursor || '';
+        if (!cursor || records.length === 0) break;
+        page++;
+        if (page > 20) break; // safety limit
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch(e) { console.error('[Epic] library-service error:', e.message); }
+  }
+
+  //  Method 3: catalog ownership API 
+  if (games.length === 0) {
+    try {
+      const url = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/bulk/items?id=${accountId}&includeDLCDetails=true&includeMainGameDetails=true&country=BR&locale=pt`;
+      console.log('[Epic] Trying catalog API...');
+      const res = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+        timeout: 20000
+      });
+      console.log('[Epic] Catalog status:', res.status);
+      if (res.ok) {
+        const data = await res.json();
+        console.log('[Epic] Catalog keys:', Object.keys(data).length);
+      }
+    } catch(e) { console.error('[Epic] Catalog error:', e.message); }
+  }
+
+  //  Fallback: installed only 
+  if (games.length === 0 && installedLocal.length > 0) {
+    console.log('[Epic] Using fallback: installed games only');
+    games = installedLocal.map(g => ({
+      id:        'epic_' + g.appName,
+      appName:   g.appName,
+      name:      g.name,
+      source:    'epic',
+      installed: true,
+      playtime:  0
+    }));
+  }
+
+  // Apply any already-cached catalog data (headers/titles from previous sessions)
+  for (const g of games) {
+    const cached = getBulkEntry(g.id);
+    if (cached?.header) g.header = cached.header;
+    if (cached?.name && cached.name !== g.name) g.name = cached.name;
+  }
+
+  // Bulk-fix codenames using catalog API with user token
+  const codenamed = games.filter(g => isInternalCodename(g.name) && g.namespace && g.catalogItemId);
+  if (codenamed.length > 0) {
+    console.log(`[Epic] Fixing ${codenamed.length} codenames via catalog API...`);
+    const byNs = {};
+    for (const g of codenamed) {
+      if (!byNs[g.namespace]) byNs[g.namespace] = [];
+      byNs[g.namespace].push(g);
+    }
+    await Promise.all(Object.entries(byNs).map(async ([ns, nsGames]) => {
+      const ids = nsGames.map(g => g.catalogItemId).join(',');
+      try {
+        const res = await fetch(
+          `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${ns}/bulk/items?id=${ids}&includeMainGameDetails=true&country=BR&locale=pt-BR`,
+          { headers: { 'Authorization': `Bearer ${accessToken}` }, timeout: 12000 }
+        );
+        if (!res.ok) return;
+        const text = await res.text();
+        if (!text || text === '{}') return;
+        const data = JSON.parse(text);
+        for (const g of nsGames) {
+          const item = data[g.catalogItemId];
+          if (!item?.title) continue;
+          const title = item.title;
+          g.name = title;
+          const ex = getBulkEntry(g.id) || {};
+          setBulkEntry(g.id, Object.assign(ex, { name: title }));
+        }
+      } catch {}
+    }));
+  }
+
+  // Sort alphabetically
+  games.sort((a, b) => a.name.localeCompare(b.name));
+
+  console.log(`[Epic] Final: ${games.length} games (${installedLocal.length} installed locally)`);
+  return { games, displayName: stored.display_name };
+});
+
+// Detect internal Epic codenames (single word, fruit/animal names, "Production" suffix)
+function isInternalCodename(name) {
+  if (!name) return true;
+  const words = name.trim().split(/\s+/);
+  if (words.length === 1) return true;
+  if (/(production|project|prototype|client|beta|test)/i.test(name)) return true;
+  // Two word names where both words are simple capitalized words (e.g. "Blunder buss")
+  if (words.length === 2 && words.every(w => /^[A-Z][a-z]+$/.test(w)) && name.length < 20) return true;
+  return false;
+}
+
+
+// Get Epic game description for a single game (called on modal open)
+ipcMain.handle('epic-get-description', async (_, { namespace, catalogItemId, appName, name }) => {
+  const cacheId = 'epic_' + (appName || catalogItemId);
+  const cached  = getBulkEntry(cacheId);
+  if (cached?.description) return { description: cached.description, genres: cached.genres };
+
+  // Try user access token against catalog API
+  const userToken = await getValidEpicToken();
+  if (userToken && namespace && catalogItemId) {
+    try {
+      const res = await fetch(
+        `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${namespace}/bulk/items?id=${catalogItemId}&includeMainGameDetails=true&country=BR&locale=pt-BR`,
+        { headers: { 'Authorization': `Bearer ${userToken}` }, timeout: 10000 }
+      );
+      if (res.ok) {
+        const text = await res.text();
+        if (text && text !== '{}') {
+          const data = JSON.parse(text);
+          const item = data[catalogItemId];
+          if (item?.description) {
+            const MAP = { 'action':'Action','adventure':'Adventure','role-playing-games-rpg':'RPG',
+              'strategy':'Strategy','simulation':'Simulation','sports':'Sports','racing':'Racing',
+              'puzzle-game':'Puzzle','shooter':'Shooter','fighting':'Fighting','horror':'Horror',
+              'survival':'Survival','indie':'Indie','casual':'Casual','platformer':'Platformer' };
+            const genres = (item.categories||[]).map(c => MAP[(c.path||'').split('/').pop()]||null).filter(Boolean);
+            const result = { description: item.description, genres };
+            const ex = getBulkEntry(cacheId)||{};
+            setBulkEntry(cacheId, Object.assign(ex, result));
+            return result;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // Fallback: Epic Store public GraphQL
+  if (name) {
+    try {
+      const query = `query($kw:String){Catalog{searchStore(keywords:$kw,count:1,category:"games/edition/base"){elements{title description}}}}`;
+      const res = await fetch('https://store.epicgames.com/graphql', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+        body: JSON.stringify({ query, variables: { kw: name } }),
+        timeout: 10000
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const el   = data?.data?.Catalog?.searchStore?.elements?.[0];
+        if (el?.description) {
+          const result = { description: el.description };
+          setBulkEntry(cacheId, Object.assign(getBulkEntry(cacheId)||{}, result));
+          return result;
+        }
+      }
+    } catch {}
+  }
+
+  return null;
+});
+
+//  SteamGridDB — fetch covers for any game by name
+const SGDB_DEFAULT_KEY = '3d5bf6fb378d0c351a64df86e95188e0';
+async function sgdbSearch(name, sgdbKey, appName) {
+  const clean = name.replace(/[™®©]/g, '').trim();
+  const appNameWords = appName
+    ? appName.replace(/([A-Z])/g, ' $1').replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim()
+    : null;
+  const attempts = [
+    clean,
+    clean.replace(/:.*/, '').trim(),
+    clean.replace(/\s*\(.*?\)/g, '').trim(),
+    appNameWords
+  ].filter((v,i,a) => v && v.length > 1 && a.indexOf(v) === i);
+
+  for (const q of attempts) {
+    try {
+      const res = await fetch(
+        `https://www.steamgriddb.com/api/v2/search/autocomplete/${encodeURIComponent(q)}`,
+        { headers: { 'Authorization': `Bearer ${sgdbKey}` }, timeout: 8000 }
+      );
+      if (!res.ok) {
+        console.log(`[SGDB] Search "${q}" status: ${res.status}`);
+        if (res.status === 401) { console.log('[SGDB] 401 — API key inválida ou expirada'); return null; }
+        continue;
+      }
+      const data = await res.json();
+      if (data?.data?.[0]) return data.data[0];
+    } catch(e) { console.log(`[SGDB] Search error: ${e.message}`); }
+  }
+  return null;
+}
+
+async function sgdbGetGrid(gameId, sgdbKey) {
+  // Try grids (portrait), then heroes (landscape) as fallback
+  const endpoints = [
+    `https://www.steamgriddb.com/api/v2/grids/game/${gameId}?dimensions=600x900,342x482&limit=3`,
+    `https://www.steamgriddb.com/api/v2/grids/game/${gameId}?limit=3`,
+    `https://www.steamgriddb.com/api/v2/heroes/game/${gameId}?limit=1`,
+    `https://www.steamgriddb.com/api/v2/logos/game/${gameId}?limit=1`
+  ];
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${sgdbKey}` }, timeout: 8000
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const items = (data?.data || []).filter(i => !i.nsfw && !i.humor);
+      const result = items[0]?.url || data?.data?.[0]?.url || null;
+      if (result) return result;
+    } catch {}
+  }
+  return null;
+}
+
+// IPC: fetch Epic covers via SteamGridDB
+ipcMain.handle('epic-fetch-covers', async (_, gamesList) => {
+  const toFetch = gamesList.filter(g => !getBulkEntry(g.id)?.header);
+  if (toFetch.length === 0) { console.log('[Epic] All covers cached'); return {}; }
+  console.log(`[Epic] Fetching ${toFetch.length} covers...`);
+
+  const updates = {};
+  const cfg     = loadConfig();
+  const sgdbKey = cfg.sgdbKey || SGDB_DEFAULT_KEY;
+  const PREFER  = ['DieselGameBoxTall','DieselStoreFrontTall','OfferImageTall','Thumbnail','DieselGameBox'];
+  const GENRE_MAP = {
+    'action':'Action','adventure':'Adventure','role-playing-games-rpg':'RPG',
+    'strategy':'Strategy','simulation':'Simulation','sports':'Sports','racing':'Racing',
+    'puzzle-game':'Puzzle','shooter':'Shooter','fighting':'Fighting','horror':'Horror',
+    'survival':'Survival','indie':'Indie','casual':'Casual','platformer':'Platformer'
+  };
+
+  //  Step 1: Epic Catalog API with client_credentials token 
+  const catalogToken = await getCatalogToken();
+  console.log('[Epic] Catalog token:', catalogToken ? 'ok' : 'failed');
+
+  if (catalogToken) {
+    const byNs = {};
+    for (const g of toFetch) {
+      if (!g.namespace || !g.catalogItemId) continue;
+      if (!byNs[g.namespace]) byNs[g.namespace] = [];
+      byNs[g.namespace].push(g);
+    }
+    const nsKeys = Object.keys(byNs);
+  
+    for (let i = 0; i < nsKeys.length; i += 6) {
+      await Promise.all(nsKeys.slice(i, i + 6).map(async ns => {
+        const games = byNs[ns];
+        const ids   = games.map(g => g.catalogItemId).join(',');
+        try {
+          const res  = await fetch(
+            `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${ns}/bulk/items?id=${ids}&includeMainGameDetails=true&country=BR&locale=pt-BR`,
+            { headers: { 'Authorization': `Bearer ${catalogToken}` }, timeout: 12000 }
+          );
+          if (!res.ok) return;
+          const text = await res.text();
+          if (!text || text === '{}') return;
+          const data = JSON.parse(text);
+          for (const g of games) {
+            const item = data[g.catalogItemId];
+            if (!item?.keyImages?.length) continue;
+            const thumb = item.keyImages.find(i => PREFER.includes(i.type))?.url || item.keyImages[0]?.url;
+            if (!thumb) continue;
+            const title  = item.title || g.name;
+            const genres = (item.categories||[]).map(c => GENRE_MAP[(c.path||'').split('/').pop()]||null).filter(Boolean);
+            const desc   = item.description || '';
+            const ex = getBulkEntry(g.id)||{};
+            setBulkEntry(g.id, Object.assign(ex, { header:thumb, name:title, genres, description:desc }));
+            updates[g.id] = { header:thumb, name:title, genres, description:desc };
+          }
+        } catch {}
+      }));
+      if (i + 6 < nsKeys.length) await new Promise(r => setTimeout(r, 200));
+    }
+    }
+
+  //  Step 2: SGDB fallback for remaining 
+  if (sgdbKey) {
+    const missing = toFetch.filter(g => !updates[g.id]);
+    if (missing.length) {
+      console.log(`[SGDB] Fallback for ${missing.length} games...`);
+      for (let i = 0; i < missing.length; i += 5) {
+        await Promise.all(missing.slice(i, i + 5).map(async g => {
+          try {
+            // Use cached real name if available (fixes codenames)
+            const cachedName = getBulkEntry(g.id)?.name || g.name;
+            const searchName = cachedName !== g.name ? cachedName : g.name;
+            const game  = await sgdbSearch(searchName, sgdbKey, g.appName);
+            if (!game) return;
+            const thumb = await sgdbGetGrid(game.id, sgdbKey);
+            if (!thumb) return;
+            const ex = getBulkEntry(g.id)||{};
+            setBulkEntry(g.id, Object.assign(ex, { header:thumb }));
+            updates[g.id] = { header:thumb, name:searchName };
+          } catch(e) { console.log('[SGDB] Error:', g.name, e.message); }
+        }));
+        if (i + 5 < missing.length) await new Promise(r => setTimeout(r, 250));
+      }
+      console.log(`[SGDB] Done: ${Object.keys(updates).length} total`);
+    }
+  }
+
+  console.log(`[Epic] Covers final: ${Object.keys(updates).length} / ${toFetch.length}`);
+  return updates;
+});
+
+// IPC: also fetch SGDB covers for Steam games missing images
+ipcMain.handle('sgdb-fetch-covers', async (_, gamesList) => {
+  const cfg     = loadConfig();
+  const sgdbKey = cfg.sgdbKey || SGDB_DEFAULT_KEY;
+  if (!sgdbKey) return {};
+
+  const toFetch = gamesList.filter(g => !getBulkEntry(g.id)?.header);
+  if (!toFetch.length) return {};
+  console.log(`[SGDB] Steam fallback covers: ${toFetch.length}`);
+
+  const updates = {};
+  const CONCUR  = 4;
+
+  async function fetchOne(g) {
+    try {
+      // For Steam games, search by appid directly
+      const res = await fetch(
+        `https://www.steamgriddb.com/api/v2/grids/steam/${g.appid}?dimensions=600x900,342x482&limit=1`,
+        { headers: { 'Authorization': `Bearer ${sgdbKey}` }, timeout: 8000 }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const url  = data?.data?.[0]?.url;
+        if (url) {
+          const existing = getBulkEntry('steam_' + g.appid) || {};
+          setBulkEntry('steam_' + g.appid, Object.assign(existing, { header: url }));
+          updates['steam_' + g.appid] = { header: url };
+          return;
+        }
+      }
+      // Fallback: search by name
+      const game = await sgdbSearch(g.name, sgdbKey);
+      if (!game) return;
+      const thumb = await sgdbGetGrid(game.id, sgdbKey);
+      if (!thumb) return;
+      const existing = getBulkEntry('steam_' + g.appid) || {};
+      setBulkEntry('steam_' + g.appid, Object.assign(existing, { header: thumb }));
+      updates['steam_' + g.appid] = { header: thumb };
+    } catch {}
+  }
+
+  for (let i = 0; i < toFetch.length; i += CONCUR) {
+    await Promise.all(toFetch.slice(i, i + CONCUR).map(fetchOne));
+    if (i + CONCUR < toFetch.length) await new Promise(r => setTimeout(r, 250));
+  }
+
+  console.log(`[SGDB] Steam fallback done: ${Object.keys(updates).length}`);
+  return updates;
+});
+
+// IPC: get Epic account info
+ipcMain.handle('epic-get-account', () => {
+  const stored = loadEpicToken();
+  if (!stored) return null;
+  return { displayName: stored.display_name, accountId: stored.account_id };
+});
+
+// IPC: disconnect Epic
+ipcMain.handle('epic-disconnect', () => {
+  clearEpicToken();
+  return true;
+});
+
+// IPC: get Epic installed games (no auth needed)
+ipcMain.handle('epic-get-installed', () => {
+  return getEpicInstalledGames();
+});
+
+// IPC: launch Epic game
+ipcMain.handle('epic-launch', (_, appName) => {
+  shell.openExternal(`com.epicgames.launcher://apps/${appName}?action=launch&silent=true`);
+  return true;
+});
+
+// IPC: get Epic game details from IGDB/SteamGridDB fallback (use Epic Store API)
+ipcMain.handle('epic-get-game-details', async (_, { catalogItemId, namespace }) => {
+  const cacheKey = `epic_${catalogItemId}`;
+  const cached = getBulkEntry(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const accessToken = await getValidEpicToken();
+    if (!accessToken) return null;
+
+    const query = `{ Catalog { catalogOffers( namespace: "${namespace || 'epic'}", params: { count: 1, keywords: "" } ) { elements { title description keyImages { type url } categories { path } } } } }`;
+
+    // Use Epic Store catalog API
+    const res = await fetch('https://www.epicgames.com/graphql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+      timeout: 10000
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const offer = data?.data?.Catalog?.catalogOffers?.elements?.[0];
+    if (!offer) return null;
+
+    const thumb = offer.keyImages?.find(i => i.type === 'Thumbnail' || i.type === 'DieselGameBoxTall')?.url
+      || offer.keyImages?.[0]?.url || null;
+
+    const result = {
+      name:        offer.title,
+      description: offer.description || '',
+      header:      thumb,
+      genres:      (offer.categories || []).map(c => c.path?.split('/')?.[1]).filter(Boolean),
+      source:      'epic'
+    };
+    setBulkEntry(cacheKey, result);
+    return result;
+  } catch { return null; }
+});
+
+
+//  IGDB (Twitch) — genre lookup for any game 
+const IGDB_CLIENT_ID     = 'qr3ysgpwy5ka5nak0kig386t8yoqhh';
+const IGDB_CLIENT_SECRET = 'rt5m7gnhcx7kt3b34klpaup2hy0ooc';
+
+let _igdbToken = null;
+let _igdbTokenExpiry = 0;
+
+async function getIgdbToken() {
+  if (_igdbToken && Date.now() < _igdbTokenExpiry - 60000) return _igdbToken;
+  try {
+    const res = await fetch(
+      `https://id.twitch.tv/oauth2/token?client_id=${IGDB_CLIENT_ID}&client_secret=${IGDB_CLIENT_SECRET}&grant_type=client_credentials`,
+      { method: 'POST', timeout: 12000 }
+    );
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch {
+      console.error('[IGDB] Token parse error, response:', text.substring(0,100));
+      return null;
+    }
+    if (!data.access_token) {
+      console.error('[IGDB] Token error:', data.message || JSON.stringify(data).substring(0,100));
+      return null;
+    }
+    _igdbToken = data.access_token;
+    _igdbTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+    return _igdbToken;
+  } catch(e) {
+    console.error('[IGDB] Token fetch error:', e.message);
+    return null;
+  }
+}
+
+const IGDB_GENRE_MAP = {
+  2:'Aventura', 4:'Ação', 5:'Ação', 7:'Casual', 8:'Plataforma',
+  9:'Puzzle', 10:'Corridas', 11:'Estratégia', 12:'RPG', 13:'Simulação', 14:'Esportes',
+  15:'Estratégia', 16:'Estratégia', 24:'Estratégia', 25:'Ação',
+  26:'Casual', 30:'Casual', 31:'Aventura', 32:'Indie', 33:'Ação',
+  34:'Visual Novel', 35:'Card Game', 36:'Ação'
+};
+
+async function igdbGetGenres(name, appName) {
+  const token = await getIgdbToken();
+  if (!token) return null;
+  const clean = name.replace(/[™®©]/g, '').replace(/:.*/,'').trim();
+  // If name looks like a codename, also try appName converted to words
+  const appNameWords = appName
+    ? appName.replace(/([A-Z])/g, ' $1').replace(/[_-]/g,' ').replace(/\s+/g,' ').trim()
+    : null;
+  try {
+    const res = await fetch('https://api.igdb.com/v4/games', {
+      method: 'POST',
+      headers: {
+        'Client-ID': IGDB_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'text/plain'
+      },
+      body: `search "${clean}"; fields name,genres,summary; limit 5;`,
+      timeout: 8000
+    });
+    if (!res.ok) {
+      console.error(`[IGDB] Games API ${res.status} for "${clean}"`);
+      return null;
+    }
+    const games = await res.json();
+    if (!games?.length) return null;
+    const cleanLow = clean.toLowerCase();
+    const best = games.find(g => g.name?.toLowerCase() === cleanLow)
+               || games.find(g => g.name?.toLowerCase().includes(cleanLow))
+               || games[0];
+    return {
+      name:        best.name || null,  // real game name from IGDB
+      genres:      (best.genres || []).map(id => IGDB_GENRE_MAP[id]).filter(Boolean),
+      description: best.summary || ''
+    };
+  } catch(e) {
+    console.error(`[IGDB] Error for "${clean}":`, e.message);
+    return null;
+  }
+}
+
+// IPC: fetch genres for a batch of games via IGDB
+// IGDB rate limit: 4 req/s — process sequentially with 300ms delay
+ipcMain.handle('igdb-fetch-genres', async (_, gamesList) => {
+  const token = await getIgdbToken();
+  if (!token) { console.log('[IGDB] No token — skipping'); return {}; }
+
+  // Filter out games already cached
+  const toFetch = gamesList.filter(g => !getBulkEntry(g.id)?.genres?.length);
+  if (!toFetch.length) { console.log('[IGDB] All genres cached'); return {}; }
+  console.log(`[IGDB] Fetching ${toFetch.length} games (sequential, 300ms delay)...`);
+
+  const updates = {};
+
+  for (let i = 0; i < toFetch.length; i++) {
+    const g = toFetch[i];
+    try {
+      const result = await igdbGetGenres(g.name, g.appName);
+      if (result?.genres?.length || result?.name) {
+        const existing = getBulkEntry(g.id) || {};
+        const normalized = normalizeGenres(result.genres || []);
+        // Use IGDB name if current name looks like an internal codename
+        // (no spaces typical of real game names, or contains "Production")
+        const isCodename = !g.name.includes(' ') || /production|project|codename/i.test(g.name);
+        const realName = (isCodename && result.name) ? result.name : (existing.name || g.name);
+        const merged = Object.assign(existing, {
+          name:        realName,
+          genres:      normalized.length ? normalized : (existing.genres || []),
+          description: result.description || existing.description || ''
+        });
+        setBulkEntry(g.id, merged);
+        updates[g.id] = { name: realName, genres: merged.genres, description: merged.description };
+      }
+    } catch {}
+    // 300ms between requests = ~3 req/s (safe under 4/s limit)
+    await new Promise(r => setTimeout(r, 300));
+    // Log progress every 20 games
+  }
+
+  // Force save cache now that batch is complete
+  if (_bulkCache) saveBulkCache();
+  console.log(`[IGDB] Done: ${Object.keys(updates).length} / ${toFetch.length}`);
+  return updates;
+});
+
+// IPC: get single game genres+description from IGDB
+ipcMain.handle('igdb-get-game', async (_, { id, name }) => {
+  const cached = getBulkEntry(id);
+  if (cached?.genres?.length && cached?.description) return cached;
+  try {
+    const result = await igdbGetGenres(name);
+    if (!result) return null;
+    const existing = getBulkEntry(id) || {};
+    const merged = Object.assign(existing, result);
+    setBulkEntry(id, merged);
+    return merged;
+  } catch { return null; }
+});
+
+
+// Save custom game name (persists in bulk cache)
+ipcMain.handle('save-game-name', (_, { id, name }) => {
+  const existing = getBulkEntry(id) || {};
+  setBulkEntry(id, Object.assign(existing, { name }));
+  saveBulkCache();
+  return true;
+});
+
+
+
+//  GOG Integration 
+const GOG_CLIENT_ID     = '46899977096215655';
+const GOG_CLIENT_SECRET = '9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9';
+const GOG_REDIRECT_URI  = 'https://embed.gog.com/on_login_success?origin=client';
+const GOG_AUTH_URL      = `https://auth.gog.com/auth?client_id=${GOG_CLIENT_ID}&redirect_uri=${encodeURIComponent(GOG_REDIRECT_URI)}&response_type=code&layout=client2`;
+const GOG_TOKEN_FILE    = path.join(app.getPath('userData'), 'gog_token.json');
+
+function loadGogToken() {
+  try { return JSON.parse(fs.readFileSync(GOG_TOKEN_FILE, 'utf8')); } catch { return null; }
+}
+function saveGogToken(t) { try { fs.writeFileSync(GOG_TOKEN_FILE, JSON.stringify(t)); } catch {} }
+function clearGogToken() { try { if (fs.existsSync(GOG_TOKEN_FILE)) fs.unlinkSync(GOG_TOKEN_FILE); } catch {} }
+
+async function getValidGogToken() {
+  const stored = loadGogToken();
+  if (!stored) return null;
+  if (stored.expires_at && Date.now() < stored.expires_at - 60000) return stored.access_token;
+  if (stored.refresh_token) {
+    try {
+      const res = await fetch(
+        `https://auth.gog.com/token?client_id=${GOG_CLIENT_ID}&client_secret=${GOG_CLIENT_SECRET}&grant_type=refresh_token&refresh_token=${stored.refresh_token}`,
+        { timeout: 10000 }
+      );
+      const data = await res.json();
+      if (data.access_token) {
+        const fresh = {
+          access_token:  data.access_token,
+          refresh_token: data.refresh_token || stored.refresh_token,
+          user_id:       data.user_id || stored.user_id,
+          username:      stored.username,
+          expires_at:    Date.now() + (data.expires_in || 3600) * 1000
+        };
+        saveGogToken(fresh);
+        return fresh.access_token;
+      }
+    } catch {}
+    clearGogToken(); return null;
+  }
+  return null;
+}
+
+// IPC: start GOG auth — opens embedded browser window, captures code automatically
+ipcMain.handle('gog-start-auth', async () => {
+  return new Promise((resolve) => {
+    const authWin = new BrowserWindow({
+      width: 520, height: 650,
+      title: 'Login GOG',
+      parent: win,  // child of main window — won't trigger app quit
+      webPreferences: { nodeIntegration: false, contextIsolation: true }
+    });
+
+    let resolved = false;
+    const done = (result) => {
+      if (resolved) return;
+      resolved = true;
+      // Destroy instead of close to avoid window-all-closed
+      if (!authWin.isDestroyed()) authWin.destroy();
+      resolve(result);
+    };
+
+    const checkUrl = (url) => {
+      try {
+        if (url.includes('on_login_success') && url.includes('code=')) {
+          const code = new URL(url).searchParams.get('code');
+          if (code) { done({ ok: true, code }); return true; }
+        }
+      } catch {}
+      return false;
+    };
+
+    authWin.loadURL(GOG_AUTH_URL);
+    authWin.webContents.on('will-navigate', (_, url) => checkUrl(url));
+    authWin.webContents.on('did-navigate', (_, url) => checkUrl(url));
+    authWin.webContents.on('did-redirect-navigation', (_, url) => checkUrl(url));
+    authWin.on('closed', () => done({ ok: false, cancelled: true }));
+  });
+});
+
+// IPC: exchange GOG code for token
+ipcMain.handle('gog-exchange-code', async (_, code) => {
+  const res = await fetch(
+    `https://auth.gog.com/token?client_id=${GOG_CLIENT_ID}&client_secret=${GOG_CLIENT_SECRET}&grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(GOG_REDIRECT_URI)}`,
+    { timeout: 15000 }
+  );
+  const data = await res.json();
+  if (!data.access_token) throw new Error(data.error_description || 'Código inválido');
+
+  let username = 'GOG User';
+  let userId   = data.user_id;
+  try {
+    const uRes = await fetch('https://embed.gog.com/userData.json', {
+      headers: { 'Authorization': `Bearer ${data.access_token}` }, timeout: 8000
+    });
+    if (uRes.ok) {
+      const ud = await uRes.json();
+      username = ud.username || ud.galaxyUserId || 'GOG User';
+      userId   = ud.userId || userId;
+    }
+  } catch {}
+
+  const token = {
+    access_token:  data.access_token,
+    refresh_token: data.refresh_token,
+    user_id:       userId,
+    username,
+    expires_at: Date.now() + (data.expires_in || 3600) * 1000
+  };
+  saveGogToken(token);
+  return { ok: true, username };
+});
+
+// IPC: get GOG account
+ipcMain.handle('gog-get-account', () => {
+  const t = loadGogToken();
+  return t ? { username: t.username, userId: t.user_id } : null;
+});
+
+// IPC: get GOG library
+ipcMain.handle('gog-get-library', async () => {
+  const token = await getValidGogToken();
+  if (!token) return { error: 'not_authenticated' };
+  const stored = loadGogToken();
+
+  try {
+    // Fetch owned games (paginated)
+    const games = [];
+    let page = 1;
+    while (true) {
+      const res = await fetch(
+        `https://embed.gog.com/account/getFilteredProducts?mediaType=1&page=${page}&totalPages=1`,
+        { headers: { 'Authorization': `Bearer ${token}` }, timeout: 15000 }
+      );
+      if (!res.ok) break;
+      const data = await res.json();
+      const products = data.products || [];
+      console.log(`[GOG] Page ${page}: ${products.length} games (total pages: ${data.totalPages})`);
+      for (const p of products) {
+        games.push({
+          id:        'gog_' + p.id,
+          gogId:     p.id,
+          name:      p.title || `GOG ${p.id}`,
+          source:    'gog',
+          installed: false,
+          playtime:  0,
+          header:    p.image ? 'https:' + p.image + '_392.jpg' : null,
+          url:       p.url || null
+        });
+      }
+      if (page >= (data.totalPages || 1)) break;
+      page++;
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    // Check installed games from GOG Galaxy local data
+    const installedGog = getGogInstalledGames();
+    const installedMap = {};
+    installedGog.forEach(g => { installedMap[g.gogId] = g; });
+    games.forEach(g => { if (installedMap[g.gogId]) g.installed = true; });
+
+    console.log(`[GOG] Total: ${games.length} games (${installedGog.length} installed)`);
+    return { games, username: stored.username };
+  } catch(e) {
+    console.error('[GOG] Library error:', e.message);
+    return { error: e.message };
+  }
+});
+
+// IPC: disconnect GOG
+ipcMain.handle('gog-disconnect', () => { clearGogToken(); return true; });
+
+// IPC: launch GOG game
+ipcMain.handle('gog-launch', (_, { gogId, installed }) => {
+  if (installed) {
+    shell.openExternal(`goggalaxy://openGame/${gogId}`);
+  } else {
+    shell.openExternal(`https://www.gog.com/game/${gogId}`);
+  }
+  return true;
+});
+
+// Get locally installed GOG games
+function getGogInstalledGames() {
+  const games = [];
+  const dirs = [
+    'C:\ProgramData\GOG.com\Galaxy\storage',
+    path.join(process.env.PROGRAMDATA || 'C:\ProgramData', 'GOG.com', 'Galaxy', 'storage')
+  ];
+  const seen = new Set();
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      // GOG stores game info in minigalaxy.db or individual folders
+      const entries = fs.readdirSync(dir);
+      for (const entry of entries) {
+        const infoFile = path.join(dir, entry, 'galaxy_info.json');
+        if (!fs.existsSync(infoFile)) continue;
+        try {
+          const info = JSON.parse(fs.readFileSync(infoFile, 'utf8'));
+          const gogId = info.gameId || info.productId;
+          if (gogId && !seen.has(gogId)) {
+            seen.add(gogId);
+            games.push({ gogId: String(gogId), name: info.name || entry });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+  return games;
+}
+
+
+//  Hidden games persistence 
+const HIDDEN_FILE = path.join(app.getPath('userData'), 'hidden_games.json');
+function loadHiddenGames() { try { return JSON.parse(fs.readFileSync(HIDDEN_FILE, 'utf8')); } catch { return []; } }
+function saveHiddenGamesData(arr) { try { fs.writeFileSync(HIDDEN_FILE, JSON.stringify(arr)); } catch {} }
+ipcMain.handle('get-hidden-games', () => loadHiddenGames());
+ipcMain.handle('save-hidden-games', (_, arr) => { saveHiddenGamesData(arr); return true; });
+
+//  Favorites persistence 
+const FAVORITES_FILE = path.join(app.getPath('userData'), 'favorites.json');
+
+function loadFavorites() {
+  try { return JSON.parse(fs.readFileSync(FAVORITES_FILE, 'utf8')); } catch { return []; }
+}
+function saveFavoritesData(arr) {
+  try { fs.writeFileSync(FAVORITES_FILE, JSON.stringify(arr)); } catch {}
+}
+
+ipcMain.handle('get-favorites', () => loadFavorites());
+ipcMain.handle('save-favorites', (_, arr) => { saveFavoritesData(arr); return true; });
+
+//  Local images persistence 
+const LOCAL_IMAGES_FILE = path.join(app.getPath('userData'), 'local_images.json');
+
+function loadLocalImages() {
+  try { return JSON.parse(fs.readFileSync(LOCAL_IMAGES_FILE, 'utf8')); } catch { return {}; }
+}
+function saveLocalImages(map) {
+  try { fs.writeFileSync(LOCAL_IMAGES_FILE, JSON.stringify(map, null, 2)); } catch {}
+}
+
+ipcMain.handle('get-local-images', () => loadLocalImages());
+
+ipcMain.handle('save-local-image', (_, { appid, filePath }) => {
+  const map = loadLocalImages();
+  map[appid] = filePath;
+  saveLocalImages(map);
+  return true;
+});
+
+ipcMain.handle('delete-local-image', (_, appid) => {
+  const map = loadLocalImages();
+  delete map[appid];
+  saveLocalImages(map);
+  return true;
+});
+
+// ── HowLongToBeat ─────────────────────────────────────────────────────────────
+// Uses hltbapi.codepotatoes.de — free public API, no auth needed
+async function fetchHltb(name, appid) {
+  const toHours = (h) => {
+    if (!h || h <= 0) return null;
+    return h < 1 ? `${Math.round(h * 60)}min` : `${Math.round(h * 10) / 10}h`;
+  };
+
+  // For Steam games: use appId directly (most accurate)
+  if (appid) {
+    try {
+      const res = await fetch(`https://hltbapi.codepotatoes.de/steam/${appid}`, { timeout: 8000 });
+      if (res.ok) {
+        const d = await res.json();
+        if (d.mainStory || d.mainStoryWithExtras || d.completionist) {
+          return {
+            main:          toHours(d.mainStory),
+            mainExtra:     toHours(d.mainStoryWithExtras),
+            completionist: toHours(d.completionist),
+            name:          d.title
+          };
+        }
+      }
+    } catch {}
+  }
+
+  // For GOG: use codepotatoes gog endpoint
+  if (appid && String(appid).startsWith('gog_')) {
+    const gogId = String(appid).replace('gog_', '');
+    try {
+      const res = await fetch(`https://hltbapi.codepotatoes.de/gog/${gogId}`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
+      if (res.ok) {
+        const d = await res.json();
+        if (d && (d.mainStory || d.mainStoryWithExtras || d.completionist)) {
+          return { main: toHours(d.mainStory), mainExtra: toHours(d.mainStoryWithExtras), completionist: toHours(d.completionist), name: d.title };
+        }
+      }
+    } catch {}
+  }
+
+  // For Epic/GOG fallback: search by title via IGDB-based HLTB search
+  // Use the IGDB name which is more accurate than codenames
+  const clean = name.replace(/[™®©]/g, '').replace(/:.*/, '').trim();
+  try {
+    // Use HLTB search via their public search API with proper headers
+    const searchRes = await fetch(`https://www.howlongtobeat.com/api/search`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Referer': 'https://howlongtobeat.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://howlongtobeat.com',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      body: JSON.stringify({
+        searchType: 'games', searchTerms: clean.split(' '), searchPage: 1, size: 5,
+        searchOptions: { games: { userId: 0, platform: '', sortCategory: 'popular', rangeCategory: 'main', rangeTime: { min: 0, max: 0 }, gameplay: { perspective: '', flow: '', genre: '' }, modifier: '' }, users: { sortCategory: 'postcount' }, filter: '', sort: 0, randomizer: 0 }
+      }),
+      timeout: 12000
+    });
+    if (searchRes.ok) {
+      const data = await searchRes.json();
+      const games = data?.data || [];
+      const cleanLow = clean.toLowerCase();
+      const best = games.find(g => g.game_name?.toLowerCase() === cleanLow) || games.find(g => g.game_name?.toLowerCase().includes(cleanLow)) || games[0];
+      if (best) {
+        const toH = (s) => { if (!s||s<=0) return null; const h=s/3600; return h<1?`${Math.round(h*60)}min`:`${Math.round(h*10)/10}h`; };
+        return { main: toH(best.comp_main), mainExtra: toH(best.comp_plus), completionist: toH(best.comp_100), name: best.game_name };
+      }
+    }
+  } catch(e) { console.log('[HLTB] Epic/GOG search error:', e.message); }
+
+  return null;
+}
+
+ipcMain.handle('hltb-get', async (_, { id, name, appid }) => {
+  const cached = getBulkEntry(id);
+  if (cached?.hltb) return cached.hltb;
+  const result = await fetchHltb(name, appid);
+  if (result) {
+    const ex = getBulkEntry(id) || {};
+    setBulkEntry(id, Object.assign(ex, { hltb: result }));
+  }
+  return result;
+});
