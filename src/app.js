@@ -152,12 +152,21 @@ function toggleTheme() {
 let _updateInfo = null;
 
 if (window.api.onUpdateAvailable) {
-  window.api.onUpdateAvailable((info)    => { _updateInfo = info; showUpdateBanner(info); });
+  window.api.onUpdateAvailable((info) => {
+    _updateInfo = info;
+    showUpdateBanner(info);
+    const btn = $('btn-check-update');
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 Verificar Agora'; }
+    const el = $('cfg-update-status');
+    if (el) { el.textContent = `🆕 Nova versão v${info.version} disponível!`; el.style.color = 'var(--accent2,#1a9fff)'; }
+  });
   window.api.onUpdateProgress((info)     => updateBannerProgress(info));
   window.api.onUpdateDownloaded((info)   => showUpdateReadyBanner(info));
   window.api.onUpdateNotAvailable?.((info) => {
     const el = $('cfg-update-status');
     if (el) { el.textContent = `✓ v${info?.version || ''} — você está atualizado`; el.style.color = 'var(--green,#22c55e)'; }
+    const btn = $('btn-check-update');
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 Verificar Agora'; }
   });
   window.api.onUpdateChecking?.(() => {
     const el = $('cfg-update-status');
@@ -172,10 +181,14 @@ if (window.api.onUpdateAvailable) {
     if (btnE) btnE.disabled = false;
   });
 
-  // Load current version
+  // Load current version and log path
   window.api.getAppVersion?.().then(v => {
     const el = $('cfg-app-version');
     if (el) el.textContent = `v${v}`;
+  });
+  window.api.getLogPath?.().then(p => {
+    const el = $('cfg-log-path');
+    if (el) { el.textContent = p; el.title = p; }
   });
 }
 
@@ -654,12 +667,15 @@ async function checkUpdateNow() {
   if (statusEl) { statusEl.textContent = '🔍 Verificando atualizações…'; statusEl.style.color = 'var(--muted,#6b7280)'; }
   const res = await window.api.checkUpdateNow?.();
   if (res?.error === 'dev-mode') {
-    if (statusEl) { statusEl.textContent = '⚙ Modo desenvolvimento — instale o app para verificar atualizações'; statusEl.style.color = 'var(--muted,#6b7280)'; }
+    if (statusEl) { statusEl.textContent = '⚙ Modo desenvolvimento — verificação disponível apenas no app instalado'; statusEl.style.color = 'var(--muted,#6b7280)'; }
     if (btn) { btn.disabled = false; btn.textContent = '🔄 Verificar Agora'; }
     return;
   }
-  // Response received — the actual result comes via onUpdateAvailable / onUpdateNotAvailable events
-  if (btn) setTimeout(() => { btn.disabled = false; btn.textContent = '🔄 Verificar Agora'; }, 5000);
+  // Result comes via onUpdateAvailable / onUpdateNotAvailable / onUpdateError events
+  // Safety: re-enable button after 15s regardless
+  setTimeout(() => {
+    if (btn && btn.disabled) { btn.disabled = false; btn.textContent = '🔄 Verificar Agora'; }
+  }, 15000);
 }
 
 async function saveIgdbCredentials() {

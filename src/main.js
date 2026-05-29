@@ -93,32 +93,49 @@ app.whenReady().then(() => {
   win.webContents.once('did-finish-load', () => {
     if (!app.isPackaged) return; // dev mode — skip
     try {
+      const log           = require('electron-log');
       const { autoUpdater } = require('electron-updater');
+
+      // Force log to file so we can diagnose
+      log.transports.file.level     = 'debug';
+      log.transports.file.resolvePathFn = () =>
+        require('path').join(app.getPath('userData'), 'logs', 'updater.log');
+      log.transports.console.level  = 'debug';
+      autoUpdater.logger            = log;
+
       autoUpdater.autoDownload         = false;
       autoUpdater.autoInstallOnAppQuit = true;
       autoUpdater.allowPrerelease      = false;
+      autoUpdater.forceDevUpdateConfig = false;
 
-      autoUpdater.logger = require('electron-log');
-      autoUpdater.logger.transports.file.level = 'info';
+      // Set feed URL explicitly from package.json publish config
+      autoUpdater.setFeedURL({
+        provider: 'github',
+        owner:    'SamuelmendesDev',
+        repo:     'gamespin',
+      });
+
+      log.info(`[Updater] App version: ${app.getVersion()}`);
+      log.info(`[Updater] Feed: github/SamuelmendesDev/gamespin`);
 
       const sendToRenderer = (channel, data) => {
         if (win && !win.isDestroyed()) win.webContents.send(channel, data);
       };
 
-      autoUpdater.on('checking-for-update',  () => {
-        console.log('[Updater] Checking...');
+      autoUpdater.on('checking-for-update', () => {
+        log.info('[Updater] Checking for updates...');
         sendToRenderer('update-checking', {});
       });
       autoUpdater.on('update-not-available', (info) => {
-        console.log('[Updater] Up to date:', info.version);
+        log.info('[Updater] Up to date:', info.version);
         sendToRenderer('update-not-available', { version: info.version });
       });
       autoUpdater.on('error', (err) => {
-        console.log('[Updater] Error:', err.message);
+        log.error('[Updater] Error:', err.message, err.stack);
         sendToRenderer('update-error', { message: err.message });
       });
       autoUpdater.on('update-available', (info) => {
-        console.log(`[Updater] Update available: v${info.version}`);
+        log.info(`[Updater] Update available: v${info.version}`);
         sendToRenderer('update-available', {
           version:      info.version,
           releaseNotes: typeof info.releaseNotes === 'string' ? info.releaseNotes : '',
@@ -126,6 +143,7 @@ app.whenReady().then(() => {
         });
       });
       autoUpdater.on('download-progress', (progress) => {
+        log.info(`[Updater] Download progress: ${Math.round(progress.percent)}%`);
         sendToRenderer('update-progress', {
           percent:        Math.round(progress.percent),
           transferred:    progress.transferred,
@@ -134,18 +152,27 @@ app.whenReady().then(() => {
         });
       });
       autoUpdater.on('update-downloaded', (info) => {
-        console.log(`[Updater] Downloaded: v${info.version}`);
+        log.info(`[Updater] Downloaded: v${info.version}`);
         sendToRenderer('update-downloaded', { version: info.version });
       });
 
-      // Check on launch (small delay to let app fully init)
+      // Check on launch
       setTimeout(() => {
-        autoUpdater.checkForUpdates().catch(e => console.log('[Updater] Check failed:', e.message));
+        log.info('[Updater] Starting initial check...');
+        autoUpdater.checkForUpdates()
+          .then(result => log.info('[Updater] Check result:', JSON.stringify(result?.updateInfo || {})))
+          .catch(e => {
+            log.error('[Updater] Check failed:', e.message);
+            sendToRenderer('update-error', { message: e.message });
+          });
       }, 3000);
 
       // Re-check every 2 hours
-      setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 2 * 60 * 60 * 1000);
-    } catch(e) { console.log('[Updater] Not available:', e.message); }
+      setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[Updater] Periodic check failed:', e.message)), 2 * 60 * 60 * 1000);
+
+    } catch(e) {
+      require('electron-log').error('[Updater] Init failed:', e.message, e.stack);
+    }
   });
 });
 
@@ -159,6 +186,10 @@ ipcMain.handle('update-check-now', () => {
 });
 
 ipcMain.handle('get-app-version', () => app.getVersion());
+
+ipcMain.handle('get-log-path', () =>
+  require('path').join(app.getPath('userData'), 'logs', 'updater.log')
+);
 
 ipcMain.handle('update-download', () => {
   try {
