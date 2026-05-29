@@ -88,48 +88,77 @@ app.whenReady().then(() => {
   setImmediate(() => {
     try { migrateGenreCache(); } catch(e) { console.error('[Migration]', e.message); }
   });
-  // Check for updates (only in packaged app)
-  if (app.isPackaged) {
+
+  // Check for updates AFTER window is ready so webContents.send works
+  win.webContents.once('did-finish-load', () => {
+    if (!app.isPackaged) return; // dev mode — skip
     try {
       const { autoUpdater } = require('electron-updater');
-      autoUpdater.autoDownload    = false; // we control download manually
+      autoUpdater.autoDownload         = false;
       autoUpdater.autoInstallOnAppQuit = true;
+      autoUpdater.allowPrerelease      = false;
 
       autoUpdater.logger = require('electron-log');
       autoUpdater.logger.transports.file.level = 'info';
 
-      autoUpdater.on('checking-for-update',  () => console.log('[Updater] Checking...'));
-      autoUpdater.on('update-not-available', () => console.log('[Updater] Up to date'));
-      autoUpdater.on('error', (err)          => console.log('[Updater] Error:', err.message));
+      const sendToRenderer = (channel, data) => {
+        if (win && !win.isDestroyed()) win.webContents.send(channel, data);
+      };
 
+      autoUpdater.on('checking-for-update',  () => {
+        console.log('[Updater] Checking...');
+        sendToRenderer('update-checking', {});
+      });
+      autoUpdater.on('update-not-available', (info) => {
+        console.log('[Updater] Up to date:', info.version);
+        sendToRenderer('update-not-available', { version: info.version });
+      });
+      autoUpdater.on('error', (err) => {
+        console.log('[Updater] Error:', err.message);
+        sendToRenderer('update-error', { message: err.message });
+      });
       autoUpdater.on('update-available', (info) => {
         console.log(`[Updater] Update available: v${info.version}`);
-        win?.webContents.send('update-available', {
+        sendToRenderer('update-available', {
           version:      info.version,
-          releaseNotes: info.releaseNotes || '',
-          releaseDate:  info.releaseDate  || ''
+          releaseNotes: typeof info.releaseNotes === 'string' ? info.releaseNotes : '',
+          releaseDate:  info.releaseDate || ''
         });
       });
-
       autoUpdater.on('download-progress', (progress) => {
-        win?.webContents.send('update-progress', {
+        sendToRenderer('update-progress', {
           percent:        Math.round(progress.percent),
           transferred:    progress.transferred,
           total:          progress.total,
           bytesPerSecond: progress.bytesPerSecond
         });
       });
-
       autoUpdater.on('update-downloaded', (info) => {
-        win?.webContents.send('update-downloaded', { version: info.version });
+        console.log(`[Updater] Downloaded: v${info.version}`);
+        sendToRenderer('update-downloaded', { version: info.version });
       });
 
-      // Check on launch, then every 4 hours
-      autoUpdater.checkForUpdates().catch(e => console.log('[Updater] Check failed:', e.message));
-      setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 60 * 60 * 1000);
+      // Check on launch (small delay to let app fully init)
+      setTimeout(() => {
+        autoUpdater.checkForUpdates().catch(e => console.log('[Updater] Check failed:', e.message));
+      }, 3000);
+
+      // Re-check every 2 hours
+      setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 2 * 60 * 60 * 1000);
     } catch(e) { console.log('[Updater] Not available:', e.message); }
-  }
+  });
 });
+
+ipcMain.handle('update-check-now', () => {
+  if (!app.isPackaged) return { error: 'dev-mode' };
+  try {
+    const { autoUpdater } = require('electron-updater');
+    autoUpdater.checkForUpdates().catch(e => console.log('[Updater] Manual check failed:', e.message));
+    return { ok: true };
+  } catch(e) { return { error: e.message }; }
+});
+
+ipcMain.handle('get-app-version', () => app.getVersion());
 
 ipcMain.handle('update-download', () => {
   try {
@@ -617,18 +646,18 @@ ipcMain.handle('local-library-remove', (_, id) => {
 });
 
 // IPC: update name or cover for a local game
-ipcMain.handle('local-library-update', (_, { id, name, coverPath, _addEntry }) => {
+ipcMain.handle('local-library-update', (_, { id, name, coverPath, coverUrl, _addEntry }) => {
   const lib = loadLocalLibrary();
   if (_addEntry) {
-    // Batch add from scan — push new entry if not already present
     if (!lib.find(g => g.id === _addEntry.id)) lib.push(_addEntry);
     saveLocalLibrary(lib);
     return true;
   }
   const entry = lib.find(g => g.id === id);
   if (!entry) return false;
-  if (name !== undefined)      entry.name      = name;
+  if (name      !== undefined) entry.name      = name;
   if (coverPath !== undefined) entry.coverPath = coverPath;
+  if (coverUrl  !== undefined) entry.coverUrl  = coverUrl;
   saveLocalLibrary(lib);
   return true;
 });
@@ -752,8 +781,220 @@ ipcMain.handle('local-library-scan-dir', async (event) => {
   return { rootDir, candidates };
 });
 
-// IPC: fetch SGDB covers for a list of local game names
-// Returns { name -> coverUrl }
+// ── Cover Cascade ─────────────────────────────────────────────────────────────
+// Tries sources in order until a cover is found:
+// 1. SGDB (by Steam appid or name search)
+// 2. IGDB cover field
+// 3. RAWG
+// 4. MobyGames
+// 5. Steam Store by name (for non-Steam games)
+
+async function igdbGetCover(name) {
+  try {
+    const token = await getIgdbToken();
+    if (!token) return null;
+    const clean = name.replace(/[™®©]/g, '').replace(/:.*/,'').trim();
+    const res = await fetch('https://api.igdb.com/v4/games', {
+      method: 'POST',
+      headers: {
+        'Client-ID': loadConfig().igdbClientId || IGDB_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'text/plain'
+      },
+      body: `search "${clean}"; fields name,cover.url; limit 3;`,
+      timeout: 10000
+    });
+    if (!res.ok) return null;
+    const games = await res.json();
+    if (!games?.length) return null;
+    const cleanLow = clean.toLowerCase();
+    const best = games.find(g => g.name?.toLowerCase() === cleanLow) || games[0];
+    if (!best?.cover?.url) return null;
+    // IGDB returns //images.igdb.com/... — upgrade to t_cover_big
+    return best.cover.url.replace('t_thumb', 't_cover_big').replace(/^\/\//, 'https://');
+  } catch { return null; }
+}
+
+async function rawgGetCover(name) {
+  try {
+    const cfg = loadConfig();
+    const key = cfg.rawgKey || '';
+    if (!key) return null;
+    const clean = name.replace(/[™®©]/g, '').trim();
+    const res = await fetch(
+      `https://api.rawg.io/api/games?key=${key}&search=${encodeURIComponent(clean)}&page_size=3`,
+      { timeout: 10000 }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const results = data?.results || [];
+    if (!results.length) return null;
+    const cleanLow = clean.toLowerCase();
+    const best = results.find(g => g.name?.toLowerCase() === cleanLow) || results[0];
+    return best?.background_image || null;
+  } catch { return null; }
+}
+
+async function mobyGamesGetCover(name) {
+  try {
+    const cfg = loadConfig();
+    const key = cfg.mobygamesKey || '';
+    if (!key) return null;
+    const clean = name.replace(/[™®©]/g, '').replace(/:.*/,'').trim();
+    const res = await fetch(
+      `https://api.mobygames.com/v1/games?api_key=${key}&title=${encodeURIComponent(clean)}&format=brief&limit=3`,
+      { timeout: 10000 }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const games = data?.games || [];
+    if (!games.length) return null;
+    const cleanLow = clean.toLowerCase();
+    const best = games.find(g => g.title?.toLowerCase() === cleanLow) || games[0];
+    if (!best?.game_id) return null;
+    // Fetch covers for the game
+    const coverRes = await fetch(
+      `https://api.mobygames.com/v1/games/${best.game_id}/covers?api_key=${key}`,
+      { timeout: 10000 }
+    );
+    if (!coverRes.ok) return null;
+    const coverData = await coverRes.json();
+    const covers = coverData?.cover_groups?.[0]?.covers || [];
+    const front = covers.find(c => c.scan_of === 'Front Cover') || covers[0];
+    return front?.image || null;
+  } catch { return null; }
+}
+
+async function steamStoreByNameGetCover(name) {
+  try {
+    const clean = name.replace(/[™®©]/g, '').trim();
+    const res = await fetch(
+      `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(clean)}&l=english&cc=US`,
+      { timeout: 10000 }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const items = data?.items || [];
+    if (!items.length) return null;
+    const cleanLow = clean.toLowerCase();
+    const best = items.find(i => i.name?.toLowerCase() === cleanLow) || items[0];
+    if (!best?.id) return null;
+    return `https://cdn.cloudflare.steamstatic.com/steam/apps/${best.id}/header.jpg`;
+  } catch { return null; }
+}
+
+// Main cascade function — tries all sources in priority order
+async function fetchCoverCascade(opts) {
+  const { name, appName, appid, sgdbKey, skipSgdb } = opts;
+
+  // Clean the name — strip codename patterns common in Epic games
+  const cleanName = name
+    .replace(/[™®©]/g, '')
+    .replace(/\s*(Production|Project|Codename|Build|Beta|Alpha|Demo|Test)\s*$/i, '')
+    .replace(/^(Project|Codename)\s+/i, '')
+    .replace(/\s+v\d+(\.\d+)*\s*$/i, '')  // version suffixes
+    .trim();
+
+  // If cleaned name is very short or looks like a slug (all lowercase, no spaces), skip
+  const isUnusable = cleanName.length < 3 || /^[a-z0-9_-]+$/.test(cleanName);
+  if (isUnusable) {
+    console.log(`[Cover] Skipping unresolvable codename: ${name}`);
+    return null;
+  }
+
+  const displayName = cleanName;
+
+  // 1. SGDB by appid (Steam only, most accurate)
+  if (!skipSgdb && sgdbKey && appid) {
+    try {
+      const res = await fetch(
+        `https://www.steamgriddb.com/api/v2/grids/steam/${appid}?dimensions=600x900,342x482&limit=1`,
+        { headers: { 'Authorization': `Bearer ${sgdbKey}` }, timeout: 8000 }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const url = data?.data?.[0]?.url;
+        if (url) { console.log(`[Cover] SGDB(appid) ✓ ${displayName}`); return url; }
+      }
+    } catch {}
+  }
+
+  // 2. SGDB by name search
+  if (!skipSgdb && sgdbKey) {
+    try {
+      const game = await sgdbSearch(displayName, sgdbKey, appName);
+      if (game) {
+        const url = await sgdbGetGrid(game.id, sgdbKey);
+        if (url) { console.log(`[Cover] SGDB(name) ✓ ${displayName}`); return url; }
+      }
+    } catch {}
+  }
+
+  // 3. IGDB cover
+  try {
+    const url = await igdbGetCover(displayName);
+    if (url) { console.log(`[Cover] IGDB ✓ ${displayName}`); return url; }
+  } catch {}
+
+  // 4. RAWG
+  try {
+    const url = await rawgGetCover(displayName);
+    if (url) { console.log(`[Cover] RAWG ✓ ${displayName}`); return url; }
+  } catch {}
+
+  // 5. MobyGames
+  try {
+    const url = await mobyGamesGetCover(displayName);
+    if (url) { console.log(`[Cover] MobyGames ✓ ${displayName}`); return url; }
+  } catch {}
+
+  // 6. Steam Store by name (for non-Steam games that exist on Steam)
+  if (!appid) {
+    try {
+      const url = await steamStoreByNameGetCover(displayName);
+      if (url) { console.log(`[Cover] Steam(name) ✓ ${displayName}`); return url; }
+    } catch {}
+  }
+
+  console.log(`[Cover] ✗ No cover found: ${displayName}`);
+  return null;
+}
+
+// IPC: fetch covers via full cascade for any game list
+ipcMain.handle('fetch-covers-cascade', async (_, gamesList) => {
+  const toFetch = gamesList.filter(g => !getBulkEntry(g.id)?.header);
+  if (!toFetch.length) return {};
+  console.log(`[Cover] Cascade fetch for ${toFetch.length} games...`);
+
+  const cfg     = loadConfig();
+  const sgdbKey = cfg.sgdbKey || SGDB_DEFAULT_KEY;
+  const updates = {};
+  const CONCUR  = 3;
+
+  async function fetchOne(g) {
+    const url = await fetchCoverCascade({
+      name:    getBulkEntry(g.id)?.name || g.name,
+      appName: g.appName,
+      appid:   g.appid,
+      sgdbKey
+    });
+    if (!url) return;
+    const ex = getBulkEntry(g.id) || {};
+    setBulkEntry(g.id, Object.assign(ex, { header: url }));
+    updates[g.id] = { header: url };
+  }
+
+  for (let i = 0; i < toFetch.length; i += CONCUR) {
+    await Promise.all(toFetch.slice(i, i + CONCUR).map(fetchOne));
+    if (i + CONCUR < toFetch.length) await new Promise(r => setTimeout(r, 300));
+  }
+
+  if (_bulkCache) saveBulkCache();
+  console.log(`[Cover] Cascade done: ${Object.keys(updates).length}/${toFetch.length}`);
+  return updates;
+});
+
+// IPC: fetch covers via full cascade for local/emulator games (by name only)
 ipcMain.handle('local-library-fetch-covers', async (_, gamesList) => {
   const cfg     = loadConfig();
   const sgdbKey = cfg.sgdbKey || SGDB_DEFAULT_KEY;
@@ -761,12 +1002,8 @@ ipcMain.handle('local-library-fetch-covers', async (_, gamesList) => {
   const CONCUR  = 2;
 
   async function fetchOne(g) {
-    try {
-      const sgdbGame = await sgdbSearch(g.name, sgdbKey);
-      if (!sgdbGame) return;
-      const url = await sgdbGetGrid(sgdbGame.id, sgdbKey);
-      if (url) results[g.id] = url;
-    } catch {}
+    const url = await fetchCoverCascade({ name: g.name, sgdbKey, skipSgdb: !sgdbKey });
+    if (url) results[g.id] = url;
     await new Promise(r => setTimeout(r, 300));
   }
 
@@ -774,9 +1011,13 @@ ipcMain.handle('local-library-fetch-covers', async (_, gamesList) => {
     await Promise.all(gamesList.slice(i, i + CONCUR).map(fetchOne));
   }
 
-  console.log(`[LocalScan] Covers fetched: ${Object.keys(results).length}/${gamesList.length}`);
+  console.log(`[Cover] Local cascade: ${Object.keys(results).length}/${gamesList.length}`);
   return results;
 });
+
+// IPC: fetch covers via full cascade for local/emulator games (by name only)
+// kept for back compat — delegates to fetch-covers-cascade
+// 
 
 
 //  Emulators 
@@ -1393,83 +1634,64 @@ ipcMain.handle('epic-fetch-covers', async (_, gamesList) => {
     }
     }
 
-  //  Step 2: SGDB fallback for remaining 
-  if (sgdbKey) {
-    const missing = toFetch.filter(g => !updates[g.id]);
-    if (missing.length) {
-      console.log(`[SGDB] Fallback for ${missing.length} games...`);
-      for (let i = 0; i < missing.length; i += 5) {
-        await Promise.all(missing.slice(i, i + 5).map(async g => {
-          try {
-            // Use cached real name if available (fixes codenames)
-            const cachedName = getBulkEntry(g.id)?.name || g.name;
-            const searchName = cachedName !== g.name ? cachedName : g.name;
-            const game  = await sgdbSearch(searchName, sgdbKey, g.appName);
-            if (!game) return;
-            const thumb = await sgdbGetGrid(game.id, sgdbKey);
-            if (!thumb) return;
-            const ex = getBulkEntry(g.id)||{};
-            setBulkEntry(g.id, Object.assign(ex, { header:thumb }));
-            updates[g.id] = { header:thumb, name:searchName };
-          } catch(e) { console.log('[SGDB] Error:', g.name, e.message); }
-        }));
-        if (i + 5 < missing.length) await new Promise(r => setTimeout(r, 250));
-      }
-      console.log(`[SGDB] Done: ${Object.keys(updates).length} total`);
+  //  Step 2: Full cascade fallback for remaining 
+  const missing = toFetch.filter(g => !updates[g.id]);
+  if (missing.length) {
+    console.log(`[Cover] Cascade fallback for ${missing.length} Epic games...`);
+    for (let i = 0; i < missing.length; i += 3) {
+      await Promise.all(missing.slice(i, i + 3).map(async g => {
+        try {
+          const cachedName = getBulkEntry(g.id)?.name || g.name;
+          const url = await fetchCoverCascade({
+            name: cachedName, appName: g.appName, sgdbKey, skipSgdb: false
+          });
+          if (!url) return;
+          const ex = getBulkEntry(g.id) || {};
+          setBulkEntry(g.id, Object.assign(ex, { header: url }));
+          updates[g.id] = { header: url, name: cachedName };
+        } catch(e) { console.log('[Cover] Error:', g.name, e.message); }
+      }));
+      if (i + 3 < missing.length) await new Promise(r => setTimeout(r, 300));
     }
+    console.log(`[Cover] Cascade done: ${Object.keys(updates).length} total`);
   }
 
   console.log(`[Epic] Covers final: ${Object.keys(updates).length} / ${toFetch.length}`);
   return updates;
 });
 
-// IPC: also fetch SGDB covers for Steam games missing images
+// IPC: fetch covers for Steam games missing images — full cascade
 ipcMain.handle('sgdb-fetch-covers', async (_, gamesList) => {
   const cfg     = loadConfig();
   const sgdbKey = cfg.sgdbKey || SGDB_DEFAULT_KEY;
-  if (!sgdbKey) return {};
 
   const toFetch = gamesList.filter(g => !getBulkEntry(g.id)?.header);
   if (!toFetch.length) return {};
-  console.log(`[SGDB] Steam fallback covers: ${toFetch.length}`);
+  console.log(`[Cover] Steam cascade covers: ${toFetch.length}`);
 
   const updates = {};
-  const CONCUR  = 4;
+  const CONCUR  = 3;
 
   async function fetchOne(g) {
     try {
-      // For Steam games, search by appid directly
-      const res = await fetch(
-        `https://www.steamgriddb.com/api/v2/grids/steam/${g.appid}?dimensions=600x900,342x482&limit=1`,
-        { headers: { 'Authorization': `Bearer ${sgdbKey}` }, timeout: 8000 }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        const url  = data?.data?.[0]?.url;
-        if (url) {
-          const existing = getBulkEntry('steam_' + g.appid) || {};
-          setBulkEntry('steam_' + g.appid, Object.assign(existing, { header: url }));
-          updates['steam_' + g.appid] = { header: url };
-          return;
-        }
-      }
-      // Fallback: search by name
-      const game = await sgdbSearch(g.name, sgdbKey);
-      if (!game) return;
-      const thumb = await sgdbGetGrid(game.id, sgdbKey);
-      if (!thumb) return;
-      const existing = getBulkEntry('steam_' + g.appid) || {};
-      setBulkEntry('steam_' + g.appid, Object.assign(existing, { header: thumb }));
-      updates['steam_' + g.appid] = { header: thumb };
+      const cachedName = getBulkEntry(g.id)?.name || g.name;
+      const url = await fetchCoverCascade({
+        name: cachedName, appid: g.appid, sgdbKey
+      });
+      if (!url) return;
+      const existing = getBulkEntry(g.id) || {};
+      setBulkEntry(g.id, Object.assign(existing, { header: url }));
+      updates[g.id] = { header: url };
     } catch {}
   }
 
   for (let i = 0; i < toFetch.length; i += CONCUR) {
     await Promise.all(toFetch.slice(i, i + CONCUR).map(fetchOne));
-    if (i + CONCUR < toFetch.length) await new Promise(r => setTimeout(r, 250));
+    if (i + CONCUR < toFetch.length) await new Promise(r => setTimeout(r, 300));
   }
 
-  console.log(`[SGDB] Steam fallback done: ${Object.keys(updates).length}`);
+  if (_bulkCache) saveBulkCache();
+  console.log(`[Cover] Steam cascade done: ${Object.keys(updates).length}/${toFetch.length}`);
   return updates;
 });
 
@@ -1596,11 +1818,15 @@ async function igdbGetGenres(name, appName, retries = 3) {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      const _cfg = loadConfig();
+      const _cid = _cfg.igdbClientId || IGDB_CLIENT_ID;
+      const _tok = await getIgdbToken();
+      if (!_tok) return null;
       const res = await fetch('https://api.igdb.com/v4/games', {
         method: 'POST',
         headers: {
-          'Client-ID': IGDB_CLIENT_ID,
-          'Authorization': `Bearer ${await getIgdbToken()}`, // refresh token each attempt
+          'Client-ID': _cid,
+          'Authorization': `Bearer ${_tok}`,
           'Content-Type': 'text/plain'
         },
         body: `search "${clean}"; fields name,genres,summary; limit 5;`,
@@ -1625,7 +1851,9 @@ async function igdbGetGenres(name, appName, retries = 3) {
       }
 
       if (!res.ok) {
-        console.error(`[IGDB] HTTP ${res.status} for "${clean}" (attempt ${attempt})`);
+        const errBody = await res.text().catch(() => '');
+        console.error(`[IGDB] HTTP ${res.status} for "${clean}" (attempt ${attempt}): ${errBody.slice(0,120)}`);
+        if (res.status === 429) { await new Promise(r => setTimeout(r, 2000 * attempt)); continue; }
         if (attempt < retries) { await new Promise(r => setTimeout(r, 800 * attempt)); continue; }
         return null;
       }
@@ -1679,7 +1907,14 @@ ipcMain.handle('igdb-fetch-genres', async (_, gamesList) => {
   const token = await getIgdbToken();
   if (!token) { console.log('[IGDB] No token — skipping'); return {}; }
 
-  const toFetch = gamesList.filter(g => !getBulkEntry(g.id)?.genres?.length);
+  const toFetch = gamesList.filter(g => {
+    const cached = getBulkEntry(g.id);
+    if (cached?.genres?.length) return false; // already has genres
+    // Don't apply _igdbChecked skip to local/emulator IDs
+    const isLocalOrEmu = g.id.startsWith('local_') || g.id.startsWith('emugame_');
+    if (!isLocalOrEmu && cached?._igdbChecked) return false; // already tried, no match
+    return true;
+  });
   if (!toFetch.length) { console.log('[IGDB] All genres cached'); return {}; }
   console.log(`[IGDB] Fetching ${toFetch.length} games (sequential, adaptive delay)...`);
 
@@ -1704,21 +1939,19 @@ ipcMain.handle('igdb-fetch-genres', async (_, gamesList) => {
         setBulkEntry(g.id, merged);
         updates[g.id] = { name: realName, genres: merged.genres, description: merged.description };
       } else {
-        // null result might mean rate limit was hit despite retries — slow down
-        consecutive429++;
-        if (consecutive429 >= 3) {
-          console.warn('[IGDB] Multiple failures — pausing 3s');
-          await new Promise(r => setTimeout(r, 3000));
-          consecutive429 = 0;
+        // No match in IGDB — mark as checked so we don't retry every boot
+        // Skip marking for local/emulator games (their IDs change between sessions)
+        const isLocalOrEmu = g.id.startsWith('local_') || g.id.startsWith('emugame_');
+        if (!isLocalOrEmu) {
+          const existing = getBulkEntry(g.id) || {};
+          setBulkEntry(g.id, Object.assign(existing, { _igdbChecked: true }));
         }
       }
     } catch {}
 
-    // Adaptive delay: slow down if getting failures
-    const delay = consecutive429 > 0 ? 800 : 350;
-    await new Promise(r => setTimeout(r, delay));
+    // 250ms delay — safe under 4 req/s IGDB limit (4 req/s = 250ms between requests)
+    await new Promise(r => setTimeout(r, 250));
 
-    // Log progress every 10 games
     if ((i + 1) % 10 === 0 || i === toFetch.length - 1) {
       console.log(`[IGDB] Progress: ${i + 1}/${toFetch.length} (${Object.keys(updates).length} hits)`);
     }

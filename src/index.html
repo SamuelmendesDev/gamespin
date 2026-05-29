@@ -347,21 +347,28 @@
         </div>
       </div>
 
-      <!-- IGDB credentials -->
+      <!-- Metadados (IGDB, RAWG, MobyGames) — collapsed into one button -->
       <div class="settings-section">
-        <div class="settings-section-title">🎮 IGDB — Gêneros e Capas</div>
-        <p class="settings-desc">Credenciais Twitch para buscar gêneros e descrições via IGDB. Gratuito em <strong>dev.twitch.tv/console</strong> → Register App → categoria "Application Integration".</p>
-        <div class="field">
-          <label>Client ID</label>
-          <input type="text" id="cfg-igdb-client-id" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off">
+        <div class="settings-section-title">📡 METADADOS</div>
+        <p class="settings-desc">Configure as APIs para buscar capas, gêneros e descrições automaticamente.</p>
+        <div class="settings-cache-card" style="margin-bottom:12px">
+          <div class="settings-cache-icon">🔑</div>
+          <div class="settings-cache-info">
+            <div class="settings-cache-label" id="meta-keys-status">Verificando chaves…</div>
+            <div class="settings-cache-sub">IGDB · RAWG · MobyGames</div>
+          </div>
         </div>
-        <div class="field">
-          <label>Client Secret</label>
-          <input type="password" id="cfg-igdb-client-secret" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off">
+        <div class="settings-cache-btns">
+          <button class="btn-ghost settings-cache-btn" id="btn-open-meta-keys">⚙ Configurar APIs</button>
         </div>
-        <button class="btn-primary" id="btn-save-igdb">SALVAR</button>
-        <div id="igdb-status" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
       </div>
+
+      <!-- Hidden fields kept for compat (filled by modal) -->
+      <input type="hidden" id="cfg-igdb-client-id">
+      <input type="hidden" id="cfg-igdb-client-secret">
+      <input type="hidden" id="cfg-rawg-key">
+      <input type="hidden" id="cfg-mobygames-key">
+      <div id="igdb-status" style="display:none"></div>
 
       <!-- Theme section -->
       <div class="settings-section">
@@ -374,6 +381,21 @@
           <button class="theme-toggle" id="btn-theme-toggle">
             <span id="theme-icon">☀️</span>
           </button>
+        </div>
+      </div>
+
+      <!-- Update section -->
+      <div class="settings-section">
+        <div class="settings-section-title">🔄 ATUALIZAÇÕES</div>
+        <div class="settings-cache-card" style="margin-bottom:12px">
+          <div class="settings-cache-icon">🚀</div>
+          <div class="settings-cache-info">
+            <div class="settings-cache-label">Versão atual: <span id="cfg-app-version">—</span></div>
+            <div class="settings-cache-sub" id="cfg-update-status">O app verifica automaticamente ao iniciar</div>
+          </div>
+        </div>
+        <div class="settings-cache-btns">
+          <button class="btn-ghost settings-cache-btn" id="btn-check-update">🔄 Verificar Agora</button>
         </div>
       </div>
 

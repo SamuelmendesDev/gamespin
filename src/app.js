@@ -37,6 +37,7 @@ let activeTagFilter = null;   // null | tagName
 
 let _splashDone    = false; // true once splash has been hidden
 let _initialLoad   = true;  // true during first boot load — suppress intermediate renders
+let _bootComplete  = false; // true after first loadAllLibraries finishes
 
 // ── Background fetch tracker ────────────────────────────────────────────────
 // Tracks all in-flight cover/genre fetches so splash can wait for them
@@ -117,6 +118,12 @@ function splashMsg(msg, pct) {
 
 function hideSplash() {
   _splashDone = true;
+  // If we have games but _initialLoad was never cleared, clear it now
+  if (_initialLoad) {
+    _initialLoad = false;
+    allGames = [...steamGames, ...epicGames, ...gogGames, ...localGames, ...emulatorGames];
+    if (allGames.length > 0) { showLibraryUI(); applyFilters(); }
+  }
   const splash = $('splash');
   const app    = $('app');
   if (!splash) return;
@@ -145,15 +152,30 @@ function toggleTheme() {
 let _updateInfo = null;
 
 if (window.api.onUpdateAvailable) {
-  window.api.onUpdateAvailable((info) => {
-    _updateInfo = info;
-    showUpdateBanner(info);
+  window.api.onUpdateAvailable((info)    => { _updateInfo = info; showUpdateBanner(info); });
+  window.api.onUpdateProgress((info)     => updateBannerProgress(info));
+  window.api.onUpdateDownloaded((info)   => showUpdateReadyBanner(info));
+  window.api.onUpdateNotAvailable?.((info) => {
+    const el = $('cfg-update-status');
+    if (el) { el.textContent = `✓ v${info?.version || ''} — você está atualizado`; el.style.color = 'var(--green,#22c55e)'; }
   });
-  window.api.onUpdateProgress((info) => {
-    updateBannerProgress(info);
+  window.api.onUpdateChecking?.(() => {
+    const el = $('cfg-update-status');
+    if (el) { el.textContent = '🔍 Verificando atualizações…'; el.style.color = 'var(--muted,#6b7280)'; }
+    const btn = $('btn-check-update');
+    if (btn) btn.disabled = true;
   });
-  window.api.onUpdateDownloaded((info) => {
-    showUpdateReadyBanner(info);
+  window.api.onUpdateError?.((info) => {
+    const el = $('cfg-update-status');
+    if (el) { el.textContent = `⚠ Erro: ${info?.message || 'falha ao verificar'}`; el.style.color = 'var(--red,#e05c5c)'; }
+    const btnE = $('btn-check-update');
+    if (btnE) btnE.disabled = false;
+  });
+
+  // Load current version
+  window.api.getAppVersion?.().then(v => {
+    const el = $('cfg-app-version');
+    if (el) el.textContent = `v${v}`;
   });
 }
 
@@ -226,8 +248,16 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Safety net — always show app after 20s even if something hangs
   const splashTimeout = setTimeout(() => {
     console.warn('[Boot] Splash timeout — forcing show');
+    _initialLoad = false;
+    _bootComplete = true;
+    if (allGames.length === 0) {
+      // Games loaded but not rendered yet — do it now
+      allGames = [...steamGames, ...epicGames, ...gogGames, ...localGames, ...emulatorGames];
+    }
     hideSplash();
-  }, 120000);
+    showLibraryUI();
+    applyFilters();
+  }, 600000); // 10 min safety
 
   const cfg = await window.api.getConfig();
   const savedFavs = await window.api.getFavorites();
@@ -246,6 +276,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   for (const g of localGames) {
     genreData[g.id] = genreData[g.id] || {};
     if (g.coverPath) genreData[g.id].localImage = 'file://' + g.coverPath.replace(/\\/g, '/');
+    if (g.coverUrl)  genreData[g.id].header     = g.coverUrl;
   }
 
   // Load emulators + emulator games
@@ -266,6 +297,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
   if (cfg.igdbClientId)     $('cfg-igdb-client-id').value     = cfg.igdbClientId;
   if (cfg.igdbClientSecret) $('cfg-igdb-client-secret').value = cfg.igdbClientSecret;
+  if (cfg.rawgKey)          $('cfg-rawg-key').value           = cfg.rawgKey;
+  if (cfg.mobygamesKey)     $('cfg-mobygames-key').value      = cfg.mobygamesKey;
+  updateMetaKeysStatus();
 
   splashMsg('Verificando contas…', 25);
   const [epicAccount, gogAccount] = await Promise.all([
@@ -362,7 +396,11 @@ function bindEvents() {
   // Cache
   $('btn-clear-library-cache').addEventListener('click', clearLibraryCache);
   $('btn-clear-genre-cache').addEventListener('click', clearGenreCache);
-  $('btn-save-igdb').addEventListener('click', saveIgdbCredentials);
+  $('btn-save-igdb')?.addEventListener('click', saveIgdbCredentials);
+  $('btn-save-rawg')?.addEventListener('click', () => saveApiKey('rawgKey', 'cfg-rawg-key', 'btn-save-rawg'));
+  $('btn-save-mobygames')?.addEventListener('click', () => saveApiKey('mobygamesKey', 'cfg-mobygames-key', 'btn-save-mobygames'));
+  $('btn-open-meta-keys').addEventListener('click', openMetaKeysModal);
+  $('btn-check-update')?.addEventListener('click', checkUpdateNow);
 
   // Modal
   $('modal-overlay').addEventListener('click', e => { if (e.target === $('modal-overlay')) closeModal(); });
@@ -448,6 +486,182 @@ async function autoDetectSteam() {
   $('path-hint').style.color = 'var(--green)';
 }
 
+
+function updateMetaKeysStatus() {
+  const el = $('meta-keys-status');
+  if (!el) return;
+  const hasIgdb  = !!(currentConfig.igdbClientId && currentConfig.igdbClientSecret);
+  const hasRawg  = !!currentConfig.rawgKey;
+  const hasMoby  = !!currentConfig.mobygamesKey;
+  const count    = [hasIgdb, hasRawg, hasMoby].filter(Boolean).length;
+  if (count === 0) {
+    el.textContent = '⚠ Nenhuma API configurada';
+    el.style.color = 'var(--red,#e05c5c)';
+  } else {
+    const names = [];
+    if (hasIgdb) names.push('IGDB');
+    if (hasRawg) names.push('RAWG');
+    if (hasMoby) names.push('MobyGames');
+    el.textContent = `✓ ${names.join(', ')} configurado${count > 1 ? 's' : ''}`;
+    el.style.color = 'var(--green,#22c55e)';
+  }
+}
+
+function openMetaKeysModal() {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:950;display:flex;align-items:center;justify-content:center;padding:20px';
+
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:16px;width:560px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.6)';
+
+  const cleanup = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
+
+  // Header
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'padding:20px 24px 14px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;flex-shrink:0';
+  hdr.innerHTML = `<div><div style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;color:var(--text,#e8eaf0)">📡 CONFIGURAR APIs</div><div style="font-size:12px;color:var(--muted,#6b7280);margin-top:2px">Capas, gêneros e descrições automáticas</div></div><button id="meta-close" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;padding:4px 8px">✕</button>`;
+  panel.appendChild(hdr);
+
+  const body = document.createElement('div');
+  body.style.cssText = 'overflow-y:auto;flex:1;padding:20px 24px;display:flex;flex-direction:column;gap:20px';
+
+  const apis = [
+    {
+      key: 'igdb',
+      icon: '🎮',
+      title: 'IGDB — Gêneros e Capas',
+      desc: 'Gratuito em <b>dev.twitch.tv/console</b> → Register App → "Application Integration"',
+      fields: [
+        { id: 'modal-igdb-client-id',     label: 'Client ID',     type: 'text',     cfgKey: 'igdbClientId',     placeholder: 'xxxxxxxxxxxxxxxxxx' },
+        { id: 'modal-igdb-client-secret', label: 'Client Secret', type: 'password', cfgKey: 'igdbClientSecret', placeholder: 'xxxxxxxxxxxxxxxxxx' }
+      ],
+      saveIds: ['modal-igdb-client-id', 'modal-igdb-client-secret'],
+      saveFn: async (fields) => {
+        currentConfig.igdbClientId     = fields[0].value.trim();
+        currentConfig.igdbClientSecret = fields[1].value.trim();
+        // Sync hidden inputs
+        const h1 = $('cfg-igdb-client-id');   if (h1) h1.value = currentConfig.igdbClientId;
+        const h2 = $('cfg-igdb-client-secret'); if (h2) h2.value = currentConfig.igdbClientSecret;
+        await window.api.saveConfig(currentConfig);
+      }
+    },
+    {
+      key: 'rawg',
+      icon: '🕹',
+      title: 'RAWG — Capas extras',
+      desc: 'Gratuito (20k req/mês) em <b>rawg.io/apidocs</b> → Login → API Key',
+      fields: [
+        { id: 'modal-rawg-key', label: 'API Key', type: 'password', cfgKey: 'rawgKey', placeholder: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }
+      ],
+      saveFn: async (fields) => {
+        currentConfig.rawgKey = fields[0].value.trim();
+        const h = $('cfg-rawg-key'); if (h) h.value = currentConfig.rawgKey;
+        await window.api.saveConfig(currentConfig);
+      }
+    },
+    {
+      key: 'mobygames',
+      icon: '📼',
+      title: 'MobyGames — Jogos clássicos',
+      desc: 'Plano gratuito em <b>mobygames.com/info/api</b>',
+      fields: [
+        { id: 'modal-moby-key', label: 'API Key', type: 'password', cfgKey: 'mobygamesKey', placeholder: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }
+      ],
+      saveFn: async (fields) => {
+        currentConfig.mobygamesKey = fields[0].value.trim();
+        const h = $('cfg-mobygames-key'); if (h) h.value = currentConfig.mobygamesKey;
+        await window.api.saveConfig(currentConfig);
+      }
+    }
+  ];
+
+  apis.forEach(api => {
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:16px';
+
+    const cardHdr = document.createElement('div');
+    cardHdr.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:10px';
+    cardHdr.innerHTML = `<span style="font-size:18px">${api.icon}</span><div><div style="font-size:13px;font-weight:600;color:var(--text,#e8eaf0)">${api.title}</div><div style="font-size:11px;color:var(--muted,#6b7280);margin-top:2px">${api.desc}</div></div>`;
+    card.appendChild(cardHdr);
+
+    const inputEls = [];
+    api.fields.forEach(f => {
+      const fieldWrap = document.createElement('div');
+      fieldWrap.style.cssText = 'margin-bottom:10px';
+      const lbl = document.createElement('label');
+      lbl.style.cssText = 'display:block;font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--muted,#6b7280);margin-bottom:5px';
+      lbl.textContent = f.label;
+      const inp = document.createElement('input');
+      inp.type = f.type; inp.id = f.id; inp.placeholder = f.placeholder;
+      inp.autocomplete = 'off';
+      inp.value = currentConfig[f.cfgKey] || '';
+      inp.style.cssText = 'width:100%;background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:9px 12px;color:var(--text,#e8eaf0);font-size:13px;outline:none;transition:border-color .15s';
+      inp.addEventListener('focus', () => inp.style.borderColor = 'var(--accent2,#1a9fff)');
+      inp.addEventListener('blur',  () => inp.style.borderColor = 'rgba(255,255,255,.12)');
+      fieldWrap.appendChild(lbl); fieldWrap.appendChild(inp);
+      card.appendChild(fieldWrap);
+      inputEls.push(inp);
+    });
+
+    // Save button + status
+    const footer = document.createElement('div');
+    footer.style.cssText = 'display:flex;align-items:center;gap:10px;margin-top:4px';
+    const saveBtn = document.createElement('button');
+    saveBtn.style.cssText = 'padding:8px 20px;border-radius:8px;border:none;background:var(--accent2,#1a9fff);color:white;font-size:12px;font-weight:700;cursor:pointer;letter-spacing:.5px';
+    saveBtn.textContent = 'SALVAR';
+    const statusSpan = document.createElement('span');
+    statusSpan.style.cssText = 'font-size:12px;color:var(--muted,#6b7280)';
+    const allFilled = api.fields.every(f => currentConfig[f.cfgKey]);
+    if (allFilled) { statusSpan.textContent = '✓ Configurado'; statusSpan.style.color = 'var(--green,#22c55e)'; }
+
+    saveBtn.onclick = async () => {
+      saveBtn.textContent = '…'; saveBtn.disabled = true;
+      try {
+        await api.saveFn(inputEls);
+        statusSpan.textContent = '✓ Salvo!'; statusSpan.style.color = 'var(--green,#22c55e)';
+        updateMetaKeysStatus();
+      } catch {
+        statusSpan.textContent = '✗ Erro'; statusSpan.style.color = 'var(--red,#e05c5c)';
+      }
+      saveBtn.textContent = 'SALVAR'; saveBtn.disabled = false;
+    };
+    inputEls.forEach(inp => inp.addEventListener('keydown', e => { if (e.key === 'Enter') saveBtn.click(); }));
+
+    footer.appendChild(saveBtn); footer.appendChild(statusSpan);
+    card.appendChild(footer);
+    body.appendChild(card);
+  });
+
+  panel.appendChild(body);
+
+  const foot = document.createElement('div');
+  foot.style.cssText = 'padding:14px 24px;border-top:1px solid rgba(255,255,255,.08);display:flex;justify-content:flex-end;flex-shrink:0';
+  foot.innerHTML = '<button id="meta-done-btn" style="padding:9px 24px;border-radius:8px;border:none;background:var(--accent2,#1a9fff);color:white;font-size:13px;font-weight:600;cursor:pointer">Fechar</button>';
+  panel.appendChild(foot);
+
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  document.getElementById('meta-close').onclick = cleanup;
+  document.getElementById('meta-done-btn').onclick = cleanup;
+}
+
+async function checkUpdateNow() {
+  const btn = $('btn-check-update');
+  const statusEl = $('cfg-update-status');
+  if (btn) { btn.disabled = true; btn.textContent = '🔍 Verificando…'; }
+  if (statusEl) { statusEl.textContent = '🔍 Verificando atualizações…'; statusEl.style.color = 'var(--muted,#6b7280)'; }
+  const res = await window.api.checkUpdateNow?.();
+  if (res?.error === 'dev-mode') {
+    if (statusEl) { statusEl.textContent = '⚙ Modo desenvolvimento — instale o app para verificar atualizações'; statusEl.style.color = 'var(--muted,#6b7280)'; }
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 Verificar Agora'; }
+    return;
+  }
+  // Response received — the actual result comes via onUpdateAvailable / onUpdateNotAvailable events
+  if (btn) setTimeout(() => { btn.disabled = false; btn.textContent = '🔄 Verificar Agora'; }, 5000);
+}
+
 async function saveIgdbCredentials() {
   const clientId     = $('cfg-igdb-client-id').value.trim();
   const clientSecret = $('cfg-igdb-client-secret').value.trim();
@@ -457,10 +671,21 @@ async function saveIgdbCredentials() {
   await window.api.saveConfig(currentConfig);
   const btn = $('btn-save-igdb');
   const statusEl = $('igdb-status');
-  btn.textContent = '✓ Salvo';
-  btn.style.background = 'var(--green, #22c55e)';
+  btn.textContent = '✓ Salvo'; btn.style.background = 'var(--green, #22c55e)';
   if (statusEl) statusEl.textContent = '✓ Credenciais salvas. Limpe o cache de gêneros e recarregue para aplicar.';
   setTimeout(() => { btn.textContent = 'SALVAR'; btn.style.background = ''; }, 2500);
+}
+
+async function saveApiKey(configKey, inputId, btnId) {
+  const value = $(inputId)?.value?.trim();
+  if (!value) return;
+  currentConfig[configKey] = value;
+  await window.api.saveConfig(currentConfig);
+  const btn = $(btnId);
+  if (!btn) return;
+  const orig = btn.textContent;
+  btn.textContent = '✓ Salvo'; btn.style.background = 'var(--green, #22c55e)';
+  setTimeout(() => { btn.textContent = orig; btn.style.background = ''; }, 2500);
 }
 
 async function savePath() {
@@ -563,8 +788,6 @@ async function loadSteamLibrary() {
   }
 
   mergeAndRender();
-  trackFetch(startGenreFetch('steam'));
-  trackFetch(fetchIgdbGenresBackground('steam'));
 }
 
 function updateSteamUI(playerRes, count) {
@@ -694,12 +917,6 @@ async function loadEpicLibrary() {
   }
 
   mergeAndRender();
-
-  // Fetch covers in background (non-blocking)
-  fetchEpicCoversBackground();
-
-  // Fetch genres via IGDB for Epic games missing genres
-  trackFetch(fetchIgdbGenresBackground('epic'));
 }
 
 function updateEpicUI(name, count) {
@@ -790,7 +1007,6 @@ async function loadGogLibrary() {
 
   updateGogUI(res.username, gogGames.length);
   mergeAndRender();
-  trackFetch(fetchIgdbGenresBackground('gog'));
 }
 
 function updateGogUI(name, count) {
@@ -809,31 +1025,46 @@ function withTimeout(promise, ms, name) {
 }
 
 async function loadAllLibraries(hasSteam, hasEpic, hasGog) {
-  // Phase 1 — load game lists (fast, from cache or API)
+  if (_bootComplete) { console.warn('[Boot] loadAllLibraries called twice — ignoring'); return; }
+  // Phase 1 — load game lists in parallel (fast)
   const listPromises = [];
   if (hasSteam) listPromises.push(withTimeout(loadSteamLibrary(), 60000, 'Steam').catch(e => console.error('Steam:', e.message)));
   if (hasEpic)  listPromises.push(withTimeout(loadEpicLibrary(),  60000, 'Epic').catch(e => console.error('Epic:', e.message)));
   if (hasGog)   listPromises.push(withTimeout(loadGogLibrary(),   60000, 'GOG').catch(e => console.error('GOG:', e.message)));
   await Promise.all(listPromises);
 
-  // Phase 2 — wait for ALL cover + genre background fetches
-  // (trackFetch() was called inside each load fn above, so _fetchPromises is now populated)
-  if (_fetchPromises.length) {
-    splashMsg(`Carregando capas e gêneros… (0/${_fetchPromises.length})`, 80);
-    let settled = 0;
-    const total = _fetchPromises.length;
-    const tracked = _fetchPromises.map(p =>
-      Promise.resolve(p).finally(() => {
-        settled++;
-        const pct = 80 + Math.round((settled / total) * 18);
-        splashMsg(`Carregando capas e gêneros… (${settled}/${total})`, pct);
-      })
-    );
-    await Promise.allSettled(tracked);
+  // Phase 2 — SEQUENTIAL fetches to avoid IGDB rate limits
+  _fetchPromises.length = 0;
+
+  if (hasSteam) {
+    splashMsg('Buscando gêneros Steam…', 75);
+    await startGenreFetch('steam').catch(() => {});
+    await fetchIgdbGenresBackground('steam').catch(() => {});
+  }
+  if (hasEpic) {
+    splashMsg('Buscando gêneros Epic…', 82);
+    await fetchIgdbGenresBackground('epic').catch(() => {});
+    splashMsg('Buscando capas Epic…', 86);
+    await fetchEpicCoversBackground().catch(() => {});
+  }
+  if (hasGog) {
+    splashMsg('Buscando gêneros GOG…', 89);
+    await fetchIgdbGenresBackground('gog').catch(() => {});
+  }
+
+  // Phase 3 — Local and emulator games: covers + genres
+  const hasLocal = localGames.length > 0;
+  const hasEmu   = emulatorGames.length > 0;
+  if (hasLocal || hasEmu) {
+    splashMsg('Buscando capas e gêneros locais…', 92);
+    await fetchLocalAndEmuCovers().catch(() => {});
+    if (hasLocal) await fetchIgdbGenresBackground('local').catch(() => {});
+    if (hasEmu)   await fetchIgdbGenresBackground('emulator').catch(() => {});
   }
 
   splashMsg('Finalizando…', 99);
   _initialLoad = false;
+  _bootComplete = true;
   mergeAndRender();
 }
 
@@ -1645,8 +1876,16 @@ async function fetchIgdbGenresBackground(source) {
   const sourceGames = source === 'steam' ? steamGames : source === 'gog' ? gogGames : source === 'local' ? localGames : source === 'emulator' ? emulatorGames : epicGames;
   if (!sourceGames.length) return;
 
+  const isLocalSource = source === 'local' || source === 'emulator';
+
   const toFetch = sourceGames
-    .filter(g => !genreData[g.id]?.genres?.length)
+    .filter(g => {
+      const gd = genreData[g.id];
+      // For local/emulator: fetch if missing genres OR description
+      if (isLocalSource) return !gd?.genres?.length || !gd?.description;
+      // For store games: fetch if missing genres
+      return !gd?.genres?.length;
+    })
     .map(g => ({ id: g.id, name: g.name, appName: g.appName }));
 
   if (!toFetch.length) return;
@@ -1665,7 +1904,7 @@ async function fetchIgdbGenresBackground(source) {
   for (const [id, data] of Object.entries(updates)) {
     if (!genreData[id]) genreData[id] = {};
     if (data.genres?.length)  genreData[id].genres      = data.genres;
-    if (data.description && !genreData[id].description) genreData[id].description = data.description;
+    if (data.description)     genreData[id].description = data.description; // always update, not just if empty
     // Fix codename titles with real IGDB name
     if (data.name) {
       genreData[id].name = data.name;
@@ -1709,6 +1948,7 @@ async function fetchEpicCoversBackground() {
 
 // ── Refresh ────────────────────────────────────────────────────────────────────
 async function refreshAll() {
+  _bootComplete = false; // allow reload
   if (currentConfig.steamid) await window.api.clearCache(currentConfig.steamid);
   steamGames = []; epicGames = [];
   const hasSteam = !!(currentConfig.key && currentConfig.steamid);
@@ -1738,6 +1978,56 @@ async function clearGenreCache() {
 }
 
 // ── Local Library ─────────────────────────────────────────────────────────────
+
+// Fetch covers for local/emulator games that don't have one yet
+async function fetchLocalAndEmuCovers() {
+  const needCover = [
+    ...localGames.filter(g => !genreData[g.id]?.localImage && !genreData[g.id]?.header),
+    ...emulatorGames.filter(g => !genreData[g.id]?.localImage && !genreData[g.id]?.header)
+  ];
+  if (!needCover.length) return;
+
+  console.log(`[Cover] Fetching covers for ${needCover.length} local/emu games...`);
+  const gamesList = needCover.map(g => ({ id: g.id, name: g.name }));
+  const results   = await window.api.localLibraryFetchCovers(gamesList).catch(() => ({}));
+
+  if (!results || !Object.keys(results).length) return;
+
+  // Apply to genreData and persist URLs back to storage
+  const localUpdates = [];
+  const emuUpdates   = [];
+
+  for (const [id, url] of Object.entries(results)) {
+    if (!url) continue;
+    if (!genreData[id]) genreData[id] = {};
+    genreData[id].header = url;
+
+    // Persist to local_library.json
+    const localGame = localGames.find(g => g.id === id);
+    if (localGame) {
+      localGame.coverUrl = url;
+      localUpdates.push({ id, coverUrl: url });
+    }
+    // Persist to emulator_games.json
+    const emuGame = emulatorGames.find(g => g.id === id);
+    if (emuGame) {
+      emuGame.coverUrl = url;
+      emuUpdates.push(emuGame);
+    }
+  }
+
+  // Batch persist
+  if (localUpdates.length) {
+    for (const u of localUpdates) {
+      await window.api.localLibraryUpdate({ id: u.id, coverUrl: u.coverUrl }).catch(() => {});
+    }
+  }
+  if (emuUpdates.length) {
+    await window.api.emulatorGamesSave(emulatorGames.map(serializeEmuGame)).catch(() => {});
+  }
+
+  console.log(`[Cover] Local/emu covers fetched: ${Object.keys(results).length}/${needCover.length}`);
+}
 
 
 function normalizeEmulatorGame(entry) {
@@ -2068,13 +2358,14 @@ function openRomScanPreviewDialog(emu, roms) {
 
 function normalizeLocalGame(entry) {
   return {
-    id:       entry.id,
-    name:     entry.name,
-    source:   'local',
-    exePath:  entry.exePath,
+    id:        entry.id,
+    name:      entry.name,
+    source:    'local',
+    exePath:   entry.exePath,
     coverPath: entry.coverPath || null,
-    addedAt:  entry.addedAt || 0,
-    playtime: 0,
+    coverUrl:  entry.coverUrl  || null,
+    addedAt:   entry.addedAt   || 0,
+    playtime:  0,
     installed: true
   };
 }

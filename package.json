@@ -1,6 +1,6 @@
 {
   "name": "gamespin",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Unified game library launcher for Steam, Epic and GOG",
   "main": "src/main.js",
   "scripts": {
