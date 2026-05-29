@@ -34,6 +34,19 @@ let hiddenGames   = new Set(); // games hidden by user
 // customTags: { tagName: { color: '#hex', games: Set<id> } }
 let customTags    = {};
 let activeTagFilter = null;   // null | tagName
+
+let _splashDone    = false; // true once splash has been hidden
+let _initialLoad   = true;  // true during first boot load — suppress intermediate renders
+
+// ── Background fetch tracker ────────────────────────────────────────────────
+// Tracks all in-flight cover/genre fetches so splash can wait for them
+const _fetchPromises = [];
+function trackFetch(promise) { _fetchPromises.push(promise); return promise; }
+async function waitForAllFetches() {
+  // Snapshot current promises and wait; new ones added during await are ignored
+  const current = [..._fetchPromises];
+  await Promise.allSettled(current);
+}
 let gogGames      = [];           // GOG library
 let localGames    = [];           // Local library (no store)
 let emulatorGames = [];           // Emulator ROMs
@@ -95,6 +108,7 @@ const $ = id => document.getElementById(id);
 
 // ── Splash screen ──────────────────────────────────────────────────────────────
 function splashMsg(msg, pct) {
+  if (_splashDone) return;
   const el = $('splash-subtitle');
   const bar = $('splash-bar');
   if (el) el.textContent = msg;
@@ -102,6 +116,7 @@ function splashMsg(msg, pct) {
 }
 
 function hideSplash() {
+  _splashDone = true;
   const splash = $('splash');
   const app    = $('app');
   if (!splash) return;
@@ -212,7 +227,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   const splashTimeout = setTimeout(() => {
     console.warn('[Boot] Splash timeout — forcing show');
     hideSplash();
-  }, 20000);
+  }, 120000);
 
   const cfg = await window.api.getConfig();
   const savedFavs = await window.api.getFavorites();
@@ -249,6 +264,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (cfg.steamPath)  $('cfg-path').value  = cfg.steamPath;
     if (cfg.steamPath2) $('cfg-path2').value = cfg.steamPath2;
   }
+  if (cfg.igdbClientId)     $('cfg-igdb-client-id').value     = cfg.igdbClientId;
+  if (cfg.igdbClientSecret) $('cfg-igdb-client-secret').value = cfg.igdbClientSecret;
 
   splashMsg('Verificando contas…', 25);
   const [epicAccount, gogAccount] = await Promise.all([
@@ -345,6 +362,7 @@ function bindEvents() {
   // Cache
   $('btn-clear-library-cache').addEventListener('click', clearLibraryCache);
   $('btn-clear-genre-cache').addEventListener('click', clearGenreCache);
+  $('btn-save-igdb').addEventListener('click', saveIgdbCredentials);
 
   // Modal
   $('modal-overlay').addEventListener('click', e => { if (e.target === $('modal-overlay')) closeModal(); });
@@ -430,6 +448,21 @@ async function autoDetectSteam() {
   $('path-hint').style.color = 'var(--green)';
 }
 
+async function saveIgdbCredentials() {
+  const clientId     = $('cfg-igdb-client-id').value.trim();
+  const clientSecret = $('cfg-igdb-client-secret').value.trim();
+  if (!clientId || !clientSecret) return;
+  currentConfig.igdbClientId     = clientId;
+  currentConfig.igdbClientSecret = clientSecret;
+  await window.api.saveConfig(currentConfig);
+  const btn = $('btn-save-igdb');
+  const statusEl = $('igdb-status');
+  btn.textContent = '✓ Salvo';
+  btn.style.background = 'var(--green, #22c55e)';
+  if (statusEl) statusEl.textContent = '✓ Credenciais salvas. Limpe o cache de gêneros e recarregue para aplicar.';
+  setTimeout(() => { btn.textContent = 'SALVAR'; btn.style.background = ''; }, 2500);
+}
+
 async function savePath() {
   const steamPath  = $('cfg-path').value.trim();
   const steamPath2 = $('cfg-path2').value.trim();
@@ -499,7 +532,7 @@ async function disconnectSteam() {
 
 async function loadSteamLibrary() {
   const { key, steamid, steamPath } = currentConfig;
-  splashMsg('Carregando biblioteca Steam…', 55);
+  splashMsg('Carregando biblioteca Steam…', 50);
   const steamPath2 = currentConfig.steamPath2 || '';
   const [gamesRes, playerRes, installedArr, installedArr2] = await Promise.all([
     window.api.getGames({ key, steamid }),
@@ -530,9 +563,8 @@ async function loadSteamLibrary() {
   }
 
   mergeAndRender();
-  startGenreFetch('steam');
-  // IGDB as fallback for Steam games that failed the Steam API fetch
-  setTimeout(() => fetchIgdbGenresBackground('steam'), 5000);
+  trackFetch(startGenreFetch('steam'));
+  trackFetch(fetchIgdbGenresBackground('steam'));
 }
 
 function updateSteamUI(playerRes, count) {
@@ -612,7 +644,7 @@ async function disconnectEpic() {
 }
 
 async function loadEpicLibrary() {
-  splashMsg('Carregando biblioteca Epic…', 70);
+  splashMsg('Carregando biblioteca Epic…', 60);
   const res = await window.api.epicGetLibrary();
   if (res.error === 'not_authenticated') return;
   if (!res.games) return;
@@ -667,7 +699,7 @@ async function loadEpicLibrary() {
   fetchEpicCoversBackground();
 
   // Fetch genres via IGDB for Epic games missing genres
-  fetchIgdbGenresBackground('epic');
+  trackFetch(fetchIgdbGenresBackground('epic'));
 }
 
 function updateEpicUI(name, count) {
@@ -735,7 +767,7 @@ async function disconnectGog() {
 }
 
 async function loadGogLibrary() {
-  splashMsg('Carregando biblioteca GOG…', 75);
+  splashMsg('Carregando biblioteca GOG…', 65);
   const res = await window.api.gogGetLibrary();
   if (res.error) return;
   gogGames     = res.games || [];
@@ -758,7 +790,7 @@ async function loadGogLibrary() {
 
   updateGogUI(res.username, gogGames.length);
   mergeAndRender();
-  fetchIgdbGenresBackground('gog');
+  trackFetch(fetchIgdbGenresBackground('gog'));
 }
 
 function updateGogUI(name, count) {
@@ -777,12 +809,32 @@ function withTimeout(promise, ms, name) {
 }
 
 async function loadAllLibraries(hasSteam, hasEpic, hasGog) {
-  const promises = [];
-  if (hasSteam) promises.push(withTimeout(loadSteamLibrary(), 30000, 'Steam').catch(e => console.error('Steam:', e.message)));
-  if (hasEpic)  promises.push(withTimeout(loadEpicLibrary(),  30000, 'Epic').catch(e => console.error('Epic:', e.message)));
-  if (hasGog)   promises.push(withTimeout(loadGogLibrary(),   30000, 'GOG').catch(e => console.error('GOG:', e.message)));
-  await Promise.all(promises);
-  showLibraryUI();
+  // Phase 1 — load game lists (fast, from cache or API)
+  const listPromises = [];
+  if (hasSteam) listPromises.push(withTimeout(loadSteamLibrary(), 60000, 'Steam').catch(e => console.error('Steam:', e.message)));
+  if (hasEpic)  listPromises.push(withTimeout(loadEpicLibrary(),  60000, 'Epic').catch(e => console.error('Epic:', e.message)));
+  if (hasGog)   listPromises.push(withTimeout(loadGogLibrary(),   60000, 'GOG').catch(e => console.error('GOG:', e.message)));
+  await Promise.all(listPromises);
+
+  // Phase 2 — wait for ALL cover + genre background fetches
+  // (trackFetch() was called inside each load fn above, so _fetchPromises is now populated)
+  if (_fetchPromises.length) {
+    splashMsg(`Carregando capas e gêneros… (0/${_fetchPromises.length})`, 80);
+    let settled = 0;
+    const total = _fetchPromises.length;
+    const tracked = _fetchPromises.map(p =>
+      Promise.resolve(p).finally(() => {
+        settled++;
+        const pct = 80 + Math.round((settled / total) * 18);
+        splashMsg(`Carregando capas e gêneros… (${settled}/${total})`, pct);
+      })
+    );
+    await Promise.allSettled(tracked);
+  }
+
+  splashMsg('Finalizando…', 99);
+  _initialLoad = false;
+  mergeAndRender();
 }
 
 function showLibraryUI() {
@@ -816,6 +868,7 @@ function showLibraryUI() {
 // ── Merge libraries ────────────────────────────────────────────────────────────
 function mergeAndRender() {
   allGames = [...steamGames, ...epicGames, ...gogGames, ...localGames, ...emulatorGames];
+  if (_initialLoad) return; // splash still showing — defer until loadAllLibraries finishes
   showLibraryUI();
   applyFilters();
   if (bpActive) { bpRenderTabs(); bpRenderGrid(); bpFocus(bpFocusIdx); }
@@ -1437,6 +1490,7 @@ async function startGenreFetch(source) {
 
   $('genre-progress-wrap').style.display = 'flex';
   $('genre-status').style.display = 'none';
+  splashMsg(`Carregando capas Steam… 0/${total}`, 80);
 
   if (source === 'steam') {
     const BATCH = 10;
@@ -1452,6 +1506,7 @@ async function startGenreFetch(source) {
       const pct = Math.round(((total - needed + done) / total) * 100);
       $('progress-fill').style.width = pct + '%';
       $('progress-lbl').textContent  = `${total - needed + done} / ${total}`;
+      splashMsg(`Carregando capas Steam… ${total - needed + done}/${total}`, 80 + Math.round(pct * 0.15));
       buildChips();
       renderGames();
     }
@@ -1596,6 +1651,7 @@ async function fetchIgdbGenresBackground(source) {
 
   if (!toFetch.length) return;
   console.log(`[IGDB] Fetching genres for ${toFetch.length} ${source} games...`);
+  splashMsg(`Buscando gêneros ${source.toUpperCase()} via IGDB… (${toFetch.length} jogos)`, 82);
 
   globalProgress.genres.total += toFetch.length;
   globalProgress.update();
@@ -1625,6 +1681,7 @@ async function fetchIgdbGenresBackground(source) {
   buildChips();
   renderGames();
   console.log(`[IGDB] Applied ${Object.keys(updates).length} genre updates`);
+  splashMsg(`Gêneros ${source.toUpperCase()} carregados ✓`, 90);
 }
 
 // ── Epic cover background fetch ────────────────────────────────────────────────
@@ -1973,7 +2030,7 @@ function openRomScanPreviewDialog(emu, roms) {
     await window.api.emulatorGamesSave(emulatorGames.map(serializeEmuGame));
     cleanup2();
     mergeAndRender(); showLibraryUI(); switchTab('emulator');
-    fetchIgdbGenresBackground('emulator');
+    trackFetch(fetchIgdbGenresBackground('emulator'));
   });
 
   // Fetch covers in background
@@ -2037,7 +2094,7 @@ async function addLocalGame() {
     mergeAndRender();
     showLibraryUI();
     // Fetch genres from IGDB in background
-    fetchIgdbGenresBackground('local');
+    trackFetch(fetchIgdbGenresBackground('local'));
     switchTab('local');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '+ Adicionar Jogo Local'; }

@@ -351,7 +351,16 @@ ipcMain.handle('steam-start-auth', async () => {
 
 // Get/save config
 ipcMain.handle('get-config', () => loadConfig());
-ipcMain.handle('save-config', (_, cfg) => { saveConfig(cfg); return true; });
+ipcMain.handle('save-config', (_, cfg) => {
+  const old = loadConfig();
+  // Invalidate IGDB token if credentials changed
+  if (cfg.igdbClientId !== old.igdbClientId || cfg.igdbClientSecret !== old.igdbClientSecret) {
+    _igdbToken = null; _igdbTokenExpiry = 0;
+    console.log('[IGDB] Credentials changed — token invalidated');
+  }
+  saveConfig(cfg);
+  return true;
+});
 
 // Browse for Steam folder
 ipcMain.handle('browse-steam-path', async (event) => {
@@ -1536,10 +1545,14 @@ let _igdbToken = null;
 let _igdbTokenExpiry = 0;
 
 async function getIgdbToken() {
+  const cfg = loadConfig();
+  const clientId     = cfg.igdbClientId     || IGDB_CLIENT_ID;
+  const clientSecret = cfg.igdbClientSecret || IGDB_CLIENT_SECRET;
+
   if (_igdbToken && Date.now() < _igdbTokenExpiry - 60000) return _igdbToken;
   try {
     const res = await fetch(
-      `https://id.twitch.tv/oauth2/token?client_id=${IGDB_CLIENT_ID}&client_secret=${IGDB_CLIENT_SECRET}&grant_type=client_credentials`,
+      `https://id.twitch.tv/oauth2/token?client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`,
       { method: 'POST', timeout: 12000 }
     );
     const text = await res.text();
@@ -1550,10 +1563,14 @@ async function getIgdbToken() {
     }
     if (!data.access_token) {
       console.error('[IGDB] Token error:', data.message || JSON.stringify(data).substring(0,100));
+      if (data.message?.includes('invalid') || data.status === 403) {
+        console.error('[IGDB] ⚠ Credenciais inválidas. Configure em Configurações → IGDB.');
+      }
       return null;
     }
     _igdbToken = data.access_token;
     _igdbTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+    console.log('[IGDB] Token OK');
     return _igdbToken;
   } catch(e) {
     console.error('[IGDB] Token fetch error:', e.message);
@@ -1569,85 +1586,144 @@ const IGDB_GENRE_MAP = {
   34:'Visual Novel', 35:'Card Game', 36:'Ação'
 };
 
-async function igdbGetGenres(name, appName) {
+async function igdbGetGenres(name, appName, retries = 3) {
   const token = await getIgdbToken();
   if (!token) return null;
   const clean = name.replace(/[™®©]/g, '').replace(/:.*/,'').trim();
-  // If name looks like a codename, also try appName converted to words
   const appNameWords = appName
     ? appName.replace(/([A-Z])/g, ' $1').replace(/[_-]/g,' ').replace(/\s+/g,' ').trim()
     : null;
-  try {
-    const res = await fetch('https://api.igdb.com/v4/games', {
-      method: 'POST',
-      headers: {
-        'Client-ID': IGDB_CLIENT_ID,
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'text/plain'
-      },
-      body: `search "${clean}"; fields name,genres,summary; limit 5;`,
-      timeout: 8000
-    });
-    if (!res.ok) {
-      console.error(`[IGDB] Games API ${res.status} for "${clean}"`);
-      return null;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch('https://api.igdb.com/v4/games', {
+        method: 'POST',
+        headers: {
+          'Client-ID': IGDB_CLIENT_ID,
+          'Authorization': `Bearer ${await getIgdbToken()}`, // refresh token each attempt
+          'Content-Type': 'text/plain'
+        },
+        body: `search "${clean}"; fields name,genres,summary; limit 5;`,
+        timeout: 12000
+      });
+
+      // Rate limited — wait and retry
+      if (res.status === 429) {
+        const wait = attempt * 1500;
+        console.warn(`[IGDB] 429 for "${clean}", retrying in ${wait}ms (attempt ${attempt}/${retries})`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+
+      // Auth error — clear cached token and retry
+      if (res.status === 401) {
+        _igdbToken = null;
+        _igdbTokenExpiry = 0;
+        console.warn(`[IGDB] 401 for "${clean}", refreshing token`);
+        await new Promise(r => setTimeout(r, 500));
+        continue;
+      }
+
+      if (!res.ok) {
+        console.error(`[IGDB] HTTP ${res.status} for "${clean}" (attempt ${attempt})`);
+        if (attempt < retries) { await new Promise(r => setTimeout(r, 800 * attempt)); continue; }
+        return null;
+      }
+
+      const games = await res.json();
+      if (!games?.length) {
+        // Try appName if game name search returned nothing
+        if (appNameWords && appNameWords !== clean && attempt === 1) {
+          const res2 = await fetch('https://api.igdb.com/v4/games', {
+            method: 'POST',
+            headers: { 'Client-ID': IGDB_CLIENT_ID, 'Authorization': `Bearer ${_igdbToken}`, 'Content-Type': 'text/plain' },
+            body: `search "${appNameWords}"; fields name,genres,summary; limit 5;`,
+            timeout: 12000
+          });
+          if (res2.ok) {
+            const games2 = await res2.json();
+            if (games2?.length) {
+              const best2 = games2[0];
+              return {
+                name:        best2.name || null,
+                genres:      (best2.genres || []).map(id => IGDB_GENRE_MAP[id]).filter(Boolean),
+                description: best2.summary || ''
+              };
+            }
+          }
+        }
+        return null;
+      }
+
+      const cleanLow = clean.toLowerCase();
+      const best = games.find(g => g.name?.toLowerCase() === cleanLow)
+                 || games.find(g => g.name?.toLowerCase().includes(cleanLow))
+                 || games[0];
+      return {
+        name:        best.name || null,
+        genres:      (best.genres || []).map(id => IGDB_GENRE_MAP[id]).filter(Boolean),
+        description: best.summary || ''
+      };
+
+    } catch(e) {
+      console.error(`[IGDB] Error for "${clean}" attempt ${attempt}:`, e.message);
+      if (attempt < retries) await new Promise(r => setTimeout(r, 800 * attempt));
     }
-    const games = await res.json();
-    if (!games?.length) return null;
-    const cleanLow = clean.toLowerCase();
-    const best = games.find(g => g.name?.toLowerCase() === cleanLow)
-               || games.find(g => g.name?.toLowerCase().includes(cleanLow))
-               || games[0];
-    return {
-      name:        best.name || null,  // real game name from IGDB
-      genres:      (best.genres || []).map(id => IGDB_GENRE_MAP[id]).filter(Boolean),
-      description: best.summary || ''
-    };
-  } catch(e) {
-    console.error(`[IGDB] Error for "${clean}":`, e.message);
-    return null;
   }
+  return null;
 }
 
 // IPC: fetch genres for a batch of games via IGDB
-// IGDB rate limit: 4 req/s — process sequentially with 300ms delay
+// IGDB rate limit: 4 req/s — process sequentially with adaptive delay
 ipcMain.handle('igdb-fetch-genres', async (_, gamesList) => {
   const token = await getIgdbToken();
   if (!token) { console.log('[IGDB] No token — skipping'); return {}; }
 
-  // Filter out games already cached
   const toFetch = gamesList.filter(g => !getBulkEntry(g.id)?.genres?.length);
   if (!toFetch.length) { console.log('[IGDB] All genres cached'); return {}; }
-  console.log(`[IGDB] Fetching ${toFetch.length} games (sequential, 300ms delay)...`);
+  console.log(`[IGDB] Fetching ${toFetch.length} games (sequential, adaptive delay)...`);
 
-  const updates = {};
+  const updates  = {};
+  let consecutive429 = 0;
 
   for (let i = 0; i < toFetch.length; i++) {
     const g = toFetch[i];
     try {
-      const result = await igdbGetGenres(g.name, g.appName);
+      const result = await igdbGetGenres(g.name, g.appName, 3);
       if (result?.genres?.length || result?.name) {
-        const existing = getBulkEntry(g.id) || {};
-        const normalized = normalizeGenres(result.genres || []);
-        // Use IGDB name if current name looks like an internal codename
-        // (no spaces typical of real game names, or contains "Production")
-        const isCodename = !g.name.includes(' ') || /production|project|codename/i.test(g.name);
-        const realName = (isCodename && result.name) ? result.name : (existing.name || g.name);
-        const merged = Object.assign(existing, {
+        consecutive429 = 0;
+        const existing    = getBulkEntry(g.id) || {};
+        const normalized  = normalizeGenres(result.genres || []);
+        const isCodename  = !g.name.includes(' ') || /production|project|codename/i.test(g.name);
+        const realName    = (isCodename && result.name) ? result.name : (existing.name || g.name);
+        const merged      = Object.assign(existing, {
           name:        realName,
           genres:      normalized.length ? normalized : (existing.genres || []),
           description: result.description || existing.description || ''
         });
         setBulkEntry(g.id, merged);
         updates[g.id] = { name: realName, genres: merged.genres, description: merged.description };
+      } else {
+        // null result might mean rate limit was hit despite retries — slow down
+        consecutive429++;
+        if (consecutive429 >= 3) {
+          console.warn('[IGDB] Multiple failures — pausing 3s');
+          await new Promise(r => setTimeout(r, 3000));
+          consecutive429 = 0;
+        }
       }
     } catch {}
-    // 300ms between requests = ~3 req/s (safe under 4/s limit)
-    await new Promise(r => setTimeout(r, 300));
-    // Log progress every 20 games
+
+    // Adaptive delay: slow down if getting failures
+    const delay = consecutive429 > 0 ? 800 : 350;
+    await new Promise(r => setTimeout(r, delay));
+
+    // Log progress every 10 games
+    if ((i + 1) % 10 === 0 || i === toFetch.length - 1) {
+      console.log(`[IGDB] Progress: ${i + 1}/${toFetch.length} (${Object.keys(updates).length} hits)`);
+    }
   }
 
-  // Force save cache now that batch is complete
   if (_bulkCache) saveBulkCache();
   console.log(`[IGDB] Done: ${Object.keys(updates).length} / ${toFetch.length}`);
   return updates;

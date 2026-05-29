@@ -347,6 +347,22 @@
         </div>
       </div>
 
+      <!-- IGDB credentials -->
+      <div class="settings-section">
+        <div class="settings-section-title">🎮 IGDB — Gêneros e Capas</div>
+        <p class="settings-desc">Credenciais Twitch para buscar gêneros e descrições via IGDB. Gratuito em <strong>dev.twitch.tv/console</strong> → Register App → categoria "Application Integration".</p>
+        <div class="field">
+          <label>Client ID</label>
+          <input type="text" id="cfg-igdb-client-id" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>Client Secret</label>
+          <input type="password" id="cfg-igdb-client-secret" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off">
+        </div>
+        <button class="btn-primary" id="btn-save-igdb">SALVAR</button>
+        <div id="igdb-status" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+      </div>
+
       <!-- Theme section -->
       <div class="settings-section">
         <div class="settings-section-title">APARÊNCIA</div>
