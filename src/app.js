@@ -31,7 +31,11 @@ let filteredGames = [];
 let installedSteam = new Set();
 let favorites     = new Set(); // persisted game ids
 let hiddenGames   = new Set(); // games hidden by user
+// customTags: { tagName: { color: '#hex', games: Set<id> } }
+let customTags    = {};
+let activeTagFilter = null;   // null | tagName
 let gogGames      = [];           // GOG library
+let localGames    = [];           // Local library (no store)
 let installedGog  = new Set();
 
 // ── Global progress tracking ────────────────────────────────────────
@@ -67,6 +71,8 @@ function hideGlobalProgress() {
 let installedEpic  = new Set();
 let visibleCount  = 60;
 let activeGenres  = new Set();
+let genresCollapsed = false;
+let tagsCollapsed   = false;
 let genreData     = {};
 let currentTab    = 'all'; // 'all' | 'steam' | 'epic'
 let currentConfig = {};
@@ -169,6 +175,19 @@ window.addEventListener('DOMContentLoaded', async () => {
   savedFavs.forEach(id => favorites.add(id));
   const savedHidden = await window.api.getHiddenGames();
   savedHidden.forEach(id => hiddenGames.add(id));
+  const savedTags = await window.api.getTags();
+  for (const [name, data] of Object.entries(savedTags || {})) {
+    customTags[name] = { color: data.color || '#6366f1', games: new Set(data.games || []) };
+  }
+  renderTagChips();
+
+  // Load local library
+  const savedLocal = await window.api.localLibraryGet();
+  localGames = (savedLocal || []).map(normalizeLocalGame);
+  for (const g of localGames) {
+    genreData[g.id] = genreData[g.id] || {};
+    if (g.coverPath) genreData[g.id].localImage = 'file://' + g.coverPath.replace(/\\/g, '/');
+  }
   currentConfig = cfg || {};
   if (cfg.key && cfg.steamid) {
     $('cfg-key').value     = cfg.key;
@@ -253,6 +272,11 @@ function bindEvents() {
   $('btn-load-more').addEventListener('click', loadMore);
   $('random-btn').addEventListener('click', pickRandom);
   $('btn-clear-genres').addEventListener('click', clearGenres);
+  $('btn-collapse-genres').addEventListener('click', toggleCollapseGenres);
+  $('btn-collapse-tags').addEventListener('click', toggleCollapseTags);
+  $('btn-clear-all-filters').addEventListener('click', clearAllFilters);
+  $('btn-add-local-game').addEventListener('click', addLocalGame);
+  $('btn-scan-local-dir').addEventListener('click', scanLocalDir);
 
   // SteamGridDB
 
@@ -290,11 +314,20 @@ function handleAction(action, data) {
   if (action === 'details')      { openModal(id); }
   if (action === 'close')        { closeModal(); }
   if (action === 'highlight')    { closeModal(); showFeatured(getGameById(id)); }
-  if (action === 'local-img')    { pickLocalImage(id); }
+  if (action === 'local-img') {
+    const g = getGameById(id);
+    if (g?.source === 'local') pickLocalGameCover(id);
+    else pickLocalImage(id);
+  }
   if (action === 'edit-name')    { editGameName(id); }
   if (action === 'close-featured')  { $('featured-wrap').style.display = 'none'; featuredAppid = null; }
   if (action === 'fav-toggle')       { toggleFavorite(id); }
   if (action === 'hide-toggle')      { toggleHidden(id); }
+  if (action === 'manage-tags')      { openTagsPopup(id); }
+  if (action === 'filter-tag')       { setTagFilter(data.tagname); }
+  if (action === 'clear-tag-filter') { setTagFilter(null); }
+  if (action === 'remove-local')     { removeLocalGame(id); }
+  if (action === 'add-local-game')   { addLocalGame(); }
 }
 
 
@@ -693,6 +726,8 @@ function showLibraryUI() {
   $('toolbar').style.display      = hasGames ? '' : 'none';
   $('random-panel').style.display = hasGames ? '' : 'none';
   $('genre-section').style.display = hasGames ? '' : 'none';
+  const tagSection = $('tag-filter-section');
+  if (tagSection) tagSection.style.display = hasGames ? '' : 'none';
 
   const hasBoth = steamGames.length > 0 && epicGames.length > 0;
   const hasAny  = steamGames.length > 0 || epicGames.length > 0 || gogGames.length > 0;
@@ -700,6 +735,8 @@ function showLibraryUI() {
   document.querySelector('.tab[data-tab="steam"]').style.display = steamGames.length > 0 ? '' : 'none';
   document.querySelector('.tab[data-tab="epic"]').style.display  = epicGames.length  > 0 ? '' : 'none';
   document.querySelector('.tab[data-tab="gog"]').style.display   = gogGames.length   > 0 ? '' : 'none';
+  const localTab = document.querySelector('.tab[data-tab="local"]');
+  if (localTab) localTab.style.display = '';
   const hiddenTab = document.querySelector('.tab[data-tab="hidden"]');
   if (hiddenTab) {
     hiddenTab.style.display = hiddenGames.size > 0 ? '' : 'none';
@@ -711,7 +748,7 @@ function showLibraryUI() {
 
 // ── Merge libraries ────────────────────────────────────────────────────────────
 function mergeAndRender() {
-  allGames = [...steamGames, ...epicGames, ...gogGames];
+  allGames = [...steamGames, ...epicGames, ...gogGames, ...localGames];
   showLibraryUI();
   applyFilters();
 }
@@ -728,6 +765,7 @@ function getTabGames() {
   if (currentTab === 'steam')     return steamGames;
   if (currentTab === 'epic')      return epicGames;
   if (currentTab === 'gog')       return gogGames;
+  if (currentTab === 'local')     return localGames;
   if (currentTab === 'favorites') return allGames.filter(g => favorites.has(g.id));
   if (currentTab === 'hidden')    return allGames.filter(g => hiddenGames.has(g.id));
   return allGames;
@@ -739,6 +777,7 @@ function applyFilters() {
   const sort = $('sort-select').value;
   let pool   = getTabGames().filter(g => {
     if (currentTab !== 'hidden' && hiddenGames.has(g.id)) return false;
+    if (activeTagFilter && !customTags[activeTagFilter]?.games.has(g.id)) return false;
     return g.name.toLowerCase().includes(q);
   });
 
@@ -764,6 +803,7 @@ function isInstalled(g) {
   if (g.source === 'steam') return installedSteam.has(g.id);
   if (g.source === 'epic')  return installedEpic.has(g.id) || g.installed;
   if (g.source === 'gog')   return installedGog.has(g.id) || g.installed;
+  if (g.source === 'local') return true;
   return false;
 }
 
@@ -822,7 +862,7 @@ function renderGames() {
     // Source badge
     const srcBadge = document.createElement('div');
     srcBadge.className = `source-mini-badge ${g.source}-mini`;
-    srcBadge.textContent = g.source === 'steam' ? 'S' : 'E';
+    srcBadge.textContent = g.source === 'steam' ? 'S' : g.source === 'epic' ? 'E' : g.source === 'gog' ? 'G' : '📁';
     card.appendChild(srcBadge);
 
     // Image — skeleton if no data yet, lazy loaded otherwise
@@ -865,6 +905,20 @@ function renderGames() {
       favBadge.className = 'fav-badge';
       favBadge.textContent = '★';
       card.appendChild(favBadge);
+    }
+    // Tag dots on card
+    const gameTags = getGameTags(g.id);
+    if (gameTags.length) {
+      const tagDots = document.createElement('div');
+      tagDots.className = 'card-tag-dots';
+      gameTags.slice(0, 3).forEach(t => {
+        const dot = document.createElement('span');
+        dot.className = 'card-tag-dot';
+        dot.style.background = customTags[t]?.color || '#6366f1';
+        dot.title = t;
+        tagDots.appendChild(dot);
+      });
+      card.appendChild(tagDots);
     }
     if (currentTab === 'hidden') {
       const hideBadge = document.createElement('div');
@@ -1083,7 +1137,11 @@ async function editGameName(id) {
     if (!genreData[id]) genreData[id] = {};
     genreData[id].name = trimmed;
 
-    await window.api.saveGameName({ id, name: trimmed });
+    if (game.source === 'local') {
+      await window.api.localLibraryUpdate({ id, name: trimmed });
+    } else {
+      await window.api.saveGameName({ id, name: trimmed });
+    }
 
     window.api.igdbGetGame({ id, name: trimmed }).then(res => {
       if (res?.genres?.length) genreData[id].genres = res.genres;
@@ -1111,6 +1169,8 @@ async function launchGame(id) {
     window.api.epicLaunch(game.appName);
   } else if (game.source === 'gog') {
     window.api.gogLaunch({ gogId: game.gogId, installed: isInstalled(game) });
+  } else if (game.source === 'local') {
+    window.api.localLibraryLaunch(game.exePath);
   }
 }
 
@@ -1213,7 +1273,11 @@ function renderModal(box, game, d) {
   body.className = 'modal-body';
   const srcBadge = game.source === 'steam'
     ? '<span class="source-badge steam-badge">STEAM</span>'
-    : '<span class="source-badge epic-badge">EPIC</span>';
+    : game.source === 'epic'
+    ? '<span class="source-badge epic-badge">EPIC</span>'
+    : game.source === 'gog'
+    ? '<span class="source-badge gog-badge">GOG</span>'
+    : '<span class="source-badge local-badge">LOCAL</span>';
   const genreTags = genres.map(g=>`<span class="genre-tag">${esc(g)}</span>`).join('');
   const catTags   = cats.map(c=>`<span class="genre-tag cat">${esc(c)}</span>`).join('');
   const screensHtml = screens.length
@@ -1257,9 +1321,15 @@ function renderModal(box, game, d) {
   actions.appendChild(modalStar);
   actions.appendChild(mkBtn('btn-ghost small','🖼 Imagem','local-img',game.id));
   actions.appendChild(mkBtn('btn-ghost small','✏️ Nome','edit-name',game.id));
+  actions.appendChild(mkBtn('btn-ghost small','🏷️ Tags','manage-tags',game.id));
   const hideBtn = mkBtn('btn-ghost small', hiddenGames.has(game.id) ? '👁 Mostrar' : '🚫 Esconder', 'hide-toggle', game.id);
   if (!hiddenGames.has(game.id)) hideBtn.style.color = 'var(--danger, #e05c5c)';
   actions.appendChild(hideBtn);
+  if (game.source === 'local') {
+    const removeBtn = mkBtn('btn-ghost small', '🗑 Remover', 'remove-local', game.id);
+    removeBtn.style.color = '#e05c5c';
+    actions.appendChild(removeBtn);
+  }
   const cl = mkBtn('btn-ghost small','Fechar','close');
   cl.style.marginLeft='auto'; actions.appendChild(cl);
   body.appendChild(actions);
@@ -1361,12 +1431,45 @@ function toggleGenre(genre) {
   });
   updateRandomSub();
   applyFilters();
+  updateClearAllBtn();
 }
 
 function clearGenres() {
   activeGenres.clear();
   document.querySelectorAll('[data-genre]').forEach(el => el.classList.remove('active'));
-  updateRandomSub(); applyFilters();
+  updateRandomSub(); applyFilters(); updateClearAllBtn();
+}
+
+function toggleCollapseGenres() {
+  genresCollapsed = !genresCollapsed;
+  const el = $('genre-collapsible');
+  const arrow = $('collapse-arrow-genres');
+  if (el) el.style.display = genresCollapsed ? 'none' : '';
+  if (arrow) arrow.textContent = genresCollapsed ? '▸' : '▾';
+}
+
+function toggleCollapseTags() {
+  tagsCollapsed = !tagsCollapsed;
+  const el = $('tag-collapsible');
+  const arrow = $('collapse-arrow-tags');
+  if (el) el.style.display = tagsCollapsed ? 'none' : '';
+  if (arrow) arrow.textContent = tagsCollapsed ? '▸' : '▾';
+}
+
+function clearAllFilters() {
+  activeGenres.clear();
+  document.querySelectorAll('[data-genre]').forEach(el => el.classList.remove('active'));
+  activeTagFilter = null;
+  renderTagChips();
+  updateRandomSub();
+  applyFilters();
+  updateClearAllBtn();
+}
+
+function updateClearAllBtn() {
+  const btn = $('btn-clear-all-filters');
+  if (!btn) return;
+  btn.style.display = (activeGenres.size > 0 || activeTagFilter) ? '' : 'none';
 }
 
 function updateRandomSub() {
@@ -1405,7 +1508,7 @@ function applyEpicUpdates(updates) {
 
 // ── IGDB genre background fetch ────────────────────────────────────────────────
 async function fetchIgdbGenresBackground(source) {
-  const sourceGames = source === 'steam' ? steamGames : source === 'gog' ? gogGames : epicGames;
+  const sourceGames = source === 'steam' ? steamGames : source === 'gog' ? gogGames : source === 'local' ? localGames : epicGames;
   if (!sourceGames.length) return;
 
   const toFetch = sourceGames
@@ -1496,6 +1599,438 @@ async function clearGenreCache() {
   genreData = {};
   $('genre-chips').innerHTML = '';
   startGenreFetch('steam');
+}
+
+// ── Local Library ─────────────────────────────────────────────────────────────
+
+function normalizeLocalGame(entry) {
+  return {
+    id:       entry.id,
+    name:     entry.name,
+    source:   'local',
+    exePath:  entry.exePath,
+    coverPath: entry.coverPath || null,
+    addedAt:  entry.addedAt || 0,
+    playtime: 0,
+    installed: true
+  };
+}
+
+async function addLocalGame() {
+  const btn = $('btn-add-local-game');
+  if (btn) { btn.disabled = true; btn.textContent = 'Aguarde…'; }
+  try {
+    const entry = await window.api.localLibraryAdd();
+    if (!entry) return;
+    const game = normalizeLocalGame(entry);
+    localGames.push(game);
+    genreData[game.id] = {};
+    if (entry.coverPath) {
+      genreData[game.id].localImage = 'file://' + entry.coverPath.replace(/\\/g, '/');
+    }
+    mergeAndRender();
+    showLibraryUI();
+    // Fetch genres from IGDB in background
+    fetchIgdbGenresBackground('local');
+    switchTab('local');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '+ Adicionar Jogo Local'; }
+  }
+}
+
+async function scanLocalDir() {
+  const btn = $('btn-scan-local-dir');
+  if (btn) { btn.disabled = true; btn.textContent = '🔍 Escaneando…'; }
+  let scanResult;
+  try {
+    scanResult = await window.api.localLibraryScanDir();
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '📁 Escanear Pasta'; }
+  }
+  if (!scanResult) return;
+  const { candidates } = scanResult;
+  if (!candidates.length) { alert('Nenhum jogo encontrado na pasta selecionada.'); return; }
+  const existingExes = new Set(localGames.map(g => g.exePath));
+  const newCandidates = candidates.filter(c => !existingExes.has(c.exePath));
+  if (!newCandidates.length) { alert('Todos os jogos encontrados já estão na biblioteca.'); return; }
+  openScanPreviewDialog(newCandidates);
+}
+
+function openScanPreviewDialog(candidates) {
+  const items = candidates.map((c, i) => ({
+    _tmpId: 'scan_' + i, name: c.name, exePath: c.exePath,
+    coverUrl: null, selected: true, fetching: false
+  }));
+
+  const overlay = document.createElement('div');
+  overlay.id = 'scan-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:700;display:flex;align-items:center;justify-content:center;padding:20px';
+
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:16px;width:720px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden';
+
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'padding:22px 24px 16px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;flex-shrink:0';
+  hdr.innerHTML = `<div><div style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px;color:var(--text,#e8eaf0)">📁 JOGOS ENCONTRADOS</div><div style="font-size:12px;color:var(--muted,#6b7280);margin-top:3px">${items.length} jogo${items.length!==1?'s':''} detectado${items.length!==1?'s':''} — selecione os que deseja adicionar</div></div><button id="scan-close-btn" style="background:none;border:none;color:var(--muted,#6b7280);cursor:pointer;font-size:18px;padding:4px 8px">✕</button>`;
+  panel.appendChild(hdr);
+
+  const progressWrap = document.createElement('div');
+  progressWrap.id = 'scan-progress-wrap';
+  progressWrap.style.cssText = 'padding:10px 24px;background:rgba(99,102,241,.07);border-bottom:1px solid rgba(255,255,255,.06);flex-shrink:0;display:none';
+  progressWrap.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px"><span style="font-size:12px;color:var(--muted,#6b7280)" id="scan-progress-lbl">Buscando capas…</span><span style="font-size:12px;font-weight:600;color:var(--accent2,#1a9fff)" id="scan-progress-pct">0%</span></div><div style="height:4px;background:rgba(255,255,255,.08);border-radius:2px"><div id="scan-progress-fill" style="height:100%;background:var(--accent2,#1a9fff);border-radius:2px;width:0%;transition:width .3s"></div></div>`;
+  panel.appendChild(progressWrap);
+
+  const selAllRow = document.createElement('div');
+  selAllRow.style.cssText = 'padding:10px 24px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.06)';
+  selAllRow.innerHTML = `<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text,#e8eaf0)"><input type="checkbox" id="scan-select-all" checked style="width:15px;height:15px;accent-color:#6366f1"> Selecionar todos</label><span id="scan-sel-count" style="font-size:12px;color:var(--muted,#6b7280)">${items.length} selecionados</span>`;
+  panel.appendChild(selAllRow);
+
+  const list = document.createElement('div');
+  list.id = 'scan-game-list';
+  list.style.cssText = 'overflow-y:auto;flex:1;padding:12px 16px;display:flex;flex-direction:column;gap:6px';
+  panel.appendChild(list);
+
+  const footer = document.createElement('div');
+  footer.style.cssText = 'padding:16px 24px;border-top:1px solid rgba(255,255,255,.08);display:flex;gap:10px;justify-content:flex-end;flex-shrink:0';
+  footer.innerHTML = `<button id="scan-cancel-btn" style="padding:9px 20px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:none;color:var(--muted,#6b7280);cursor:pointer;font-size:13px">Cancelar</button><button id="scan-add-btn" style="padding:9px 22px;border-radius:8px;border:none;background:linear-gradient(135deg,#6366f1,#4f46e5);color:white;cursor:pointer;font-size:13px;font-weight:600">Adicionar Selecionados</button>`;
+  panel.appendChild(footer);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  function updateSelCount() {
+    const n = items.filter(i => i.selected).length;
+    const el = document.getElementById('scan-sel-count');
+    if (el) el.textContent = `${n} selecionado${n!==1?'s':''}`;
+    const addBtn = document.getElementById('scan-add-btn');
+    if (addBtn) addBtn.disabled = n === 0;
+  }
+
+  function renderList() {
+    list.innerHTML = '';
+    items.forEach(item => {
+      const row = document.createElement('div');
+      row.id = 'scan-row-' + item._tmpId;
+      row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:10px;background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.06)';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = item.selected;
+      cb.style.cssText = 'width:15px;height:15px;accent-color:#6366f1;flex-shrink:0;cursor:pointer';
+      cb.addEventListener('change', () => { item.selected = cb.checked; updateSelCount(); const sa = document.getElementById('scan-select-all'); if (sa) sa.checked = items.every(i => i.selected); });
+      const coverWrap = document.createElement('div');
+      coverWrap.style.cssText = 'width:42px;height:56px;border-radius:6px;overflow:hidden;flex-shrink:0;background:rgba(255,255,255,.05);display:flex;align-items:center;justify-content:center;font-size:20px';
+      if (item.coverUrl) { const img = document.createElement('img'); img.src = item.coverUrl; img.style.cssText = 'width:100%;height:100%;object-fit:cover'; img.addEventListener('error', () => { coverWrap.innerHTML = '🎮'; }); coverWrap.appendChild(img); }
+      else if (item.fetching) { coverWrap.innerHTML = '<div style="width:22px;height:22px;border:2px solid rgba(255,255,255,.2);border-top-color:#6366f1;border-radius:50%;animation:spin .7s linear infinite"></div>'; }
+      else { coverWrap.textContent = '🎮'; }
+      const info = document.createElement('div'); info.style.cssText = 'flex:1;min-width:0';
+      const nameEl = document.createElement('input'); nameEl.type = 'text'; nameEl.value = item.name;
+      nameEl.style.cssText = 'background:transparent;border:none;border-bottom:1px solid transparent;color:var(--text,#e8eaf0);font-size:13px;font-weight:600;width:100%;outline:none;padding:2px 0;transition:border-color .15s';
+      nameEl.addEventListener('focus', () => nameEl.style.borderBottomColor = '#6366f1');
+      nameEl.addEventListener('blur', () => { nameEl.style.borderBottomColor = 'transparent'; item.name = nameEl.value.trim() || item.name; nameEl.value = item.name; });
+      nameEl.addEventListener('keydown', e => { if (e.key === 'Enter') nameEl.blur(); });
+      const pathEl = document.createElement('div'); pathEl.style.cssText = 'font-size:10px;color:var(--muted,#6b7280);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px'; pathEl.title = item.exePath; pathEl.textContent = item.exePath;
+      info.appendChild(nameEl); info.appendChild(pathEl);
+      row.appendChild(cb); row.appendChild(coverWrap); row.appendChild(info);
+      list.appendChild(row);
+    });
+  }
+
+  renderList();
+  updateSelCount();
+
+  document.getElementById('scan-select-all').addEventListener('change', e => { items.forEach(i => i.selected = e.target.checked); renderList(); updateSelCount(); });
+  const cleanup = () => overlay.remove();
+  document.getElementById('scan-close-btn').addEventListener('click', cleanup);
+  document.getElementById('scan-cancel-btn').addEventListener('click', cleanup);
+  overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
+
+  document.getElementById('scan-add-btn').addEventListener('click', async () => {
+    const selected = items.filter(i => i.selected);
+    if (!selected.length) return;
+    const addBtn = document.getElementById('scan-add-btn');
+    addBtn.disabled = true; addBtn.textContent = 'Adicionando…';
+    for (const item of selected) {
+      const id = 'local_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+      const entry = { id, name: item.name, exePath: item.exePath, coverPath: null, addedAt: Date.now() };
+      await window.api.localLibraryUpdate({ id: entry.id, _addEntry: entry });
+      const game = normalizeLocalGame(entry);
+      localGames.push(game);
+      genreData[game.id] = {};
+      if (item.coverUrl) genreData[game.id].header = item.coverUrl;
+    }
+    cleanup();
+    mergeAndRender();
+    showLibraryUI();
+    switchTab('local');
+    fetchIgdbGenresBackground('local');
+  });
+
+  setTimeout(async () => {
+    progressWrap.style.display = '';
+    let done = 0; const total = items.length;
+    const updateProgress = () => {
+      const pct = Math.round((done / total) * 100);
+      const fill = document.getElementById('scan-progress-fill');
+      const pctEl = document.getElementById('scan-progress-pct');
+      const lbl   = document.getElementById('scan-progress-lbl');
+      if (fill) fill.style.width = pct + '%';
+      if (pctEl) pctEl.textContent = pct + '%';
+      if (lbl) lbl.textContent = done >= total ? '✓ Capas carregadas' : `Buscando capas… ${done}/${total}`;
+    };
+    items.forEach(i => { i.fetching = true; }); renderList();
+    const CONCUR = 3;
+    async function fetchCover(item) {
+      try {
+        const res = await window.api.localLibraryFetchCovers([{ id: item._tmpId, name: item.name }]);
+        if (res && res[item._tmpId]) item.coverUrl = res[item._tmpId];
+      } catch {}
+      item.fetching = false; done++; updateProgress();
+      const row = document.getElementById('scan-row-' + item._tmpId);
+      if (row) {
+        const coverWrap = row.children[1];
+        if (item.coverUrl) { coverWrap.innerHTML = ''; const img = document.createElement('img'); img.src = item.coverUrl; img.style.cssText = 'width:100%;height:100%;object-fit:cover'; img.addEventListener('error', () => { coverWrap.innerHTML = '🎮'; }); coverWrap.appendChild(img); }
+        else { coverWrap.innerHTML = '🎮'; }
+      }
+    }
+    for (let i = 0; i < total; i += CONCUR) { await Promise.all(items.slice(i, i + CONCUR).map(fetchCover)); }
+    if (done >= total) setTimeout(() => { if (progressWrap.parentNode) progressWrap.style.display = 'none'; }, 2000);
+  }, 100);
+}
+
+async function removeLocalGame(id) {
+  if (!confirm('Remover este jogo da biblioteca local?')) return;
+  await window.api.localLibraryRemove(id);
+  localGames = localGames.filter(g => g.id !== id);
+  closeModal();
+  mergeAndRender();
+  showLibraryUI();
+}
+
+async function pickLocalGameCover(id) {
+  const filePath = await window.api.localLibraryPickCover();
+  if (!filePath) return;
+  await window.api.localLibraryUpdate({ id, coverPath: filePath });
+  const game = localGames.find(g => g.id === id);
+  if (game) game.coverPath = filePath;
+  if (!genreData[id]) genreData[id] = {};
+  genreData[id].localImage = 'file://' + filePath.replace(/\\/g, '/');
+  noImageSet.delete(id);
+  const card = $('card-' + id);
+  if (card) {
+    const old = card.querySelector('img, .gc-thumb-err, .gc-thumb-skeleton');
+    if (old) {
+      const img = document.createElement('img');
+      img.className = 'gc-thumb'; img.src = genreData[id].localImage; img.alt = '';
+      img.addEventListener('error', () => img.replaceWith(mkErr('gc-thumb-err')), { once: true });
+      old.replaceWith(img);
+    }
+  }
+  if (featuredAppid === id) showFeatured(getGameById(id));
+  // Update modal if open
+  const overlay = $('modal-overlay');
+  if (overlay.classList.contains('open')) renderModal($('modal-box'), getGameById(id), genreData[id]);
+}
+
+// ── Custom Tags ───────────────────────────────────────────────────────────────
+
+const TAG_PALETTE = [
+  '#6366f1','#8b5cf6','#ec4899','#f43f5e','#f97316',
+  '#eab308','#22c55e','#10b981','#06b6d4','#3b82f6'
+];
+
+function serializeTags() {
+  const out = {};
+  for (const [name, data] of Object.entries(customTags)) {
+    out[name] = { color: data.color, games: [...data.games] };
+  }
+  return out;
+}
+
+async function persistTags() {
+  await window.api.saveTags(serializeTags());
+}
+
+function getGameTags(id) {
+  return Object.entries(customTags)
+    .filter(([, data]) => data.games.has(id))
+    .map(([name]) => name);
+}
+
+function setTagFilter(tagName) {
+  activeTagFilter = tagName;
+  renderTagChips();
+  applyFilters();
+  updateClearAllBtn();
+}
+
+function renderTagChips() {
+  const container = $('tag-filter-chips');
+  if (!container) return;
+  container.innerHTML = '';
+
+  const names = Object.keys(customTags);
+  if (!names.length) {
+    container.style.display = 'none';
+    return;
+  }
+  container.style.display = '';
+
+  // "Todos" pill
+  const allBtn = document.createElement('button');
+  allBtn.className = 'chip tag-chip' + (!activeTagFilter ? ' active' : '');
+  allBtn.dataset.action = 'clear-tag-filter';
+  allBtn.innerHTML = `<span class="chip-name">Todos</span>`;
+  container.appendChild(allBtn);
+
+  names.forEach(name => {
+    const t   = customTags[name];
+    const cnt = t.games.size;
+    const btn = document.createElement('button');
+    btn.className = 'chip tag-chip' + (activeTagFilter === name ? ' active' : '');
+    btn.style.setProperty('--tag-color', t.color);
+    btn.dataset.action  = 'filter-tag';
+    btn.dataset.tagname = name;
+    btn.innerHTML = `<span class="tag-chip-dot" style="background:${t.color}"></span>`
+      + `<span class="chip-name">${esc(name)}</span>`
+      + `<span class="chip-cnt">${cnt}</span>`;
+    container.appendChild(btn);
+  });
+}
+
+function openTagsPopup(gameId) {
+  const game = getGameById(gameId);
+  if (!game) return;
+
+  const overlay = document.createElement('div');
+  overlay.id = 'tags-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:600;display:flex;align-items:center;justify-content:center';
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--surface,#13161d);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:28px 28px 22px;width:420px;max-width:92vw;display:flex;flex-direction:column;gap:16px;box-shadow:0 20px 60px rgba(0,0,0,.5)';
+
+  function render() {
+    box.innerHTML = '';
+
+    // Header
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'display:flex;align-items:center;justify-content:space-between';
+    hdr.innerHTML = `<div style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;color:var(--text,#e8eaf0)">🏷️ TAGS — ${esc(game.name)}</div>`;
+    const closeX = document.createElement('button');
+    closeX.textContent = '✕';
+    closeX.style.cssText = 'background:none;border:none;color:var(--muted,#6b7280);cursor:pointer;font-size:16px;padding:2px 6px';
+    closeX.onclick = cleanup;
+    hdr.appendChild(closeX);
+    box.appendChild(hdr);
+
+    // Existing tags with toggle
+    const gameTags = getGameTags(gameId);
+    const allNames = Object.keys(customTags);
+    if (allNames.length) {
+      const list = document.createElement('div');
+      list.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px';
+      allNames.forEach(name => {
+        const t      = customTags[name];
+        const active = gameTags.includes(name);
+        const pill   = document.createElement('button');
+        pill.style.cssText = `display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:999px;border:2px solid ${t.color};background:${active ? t.color+'33' : 'transparent'};color:var(--text,#e8eaf0);cursor:pointer;font-size:13px;font-weight:500;transition:all .15s`;
+        pill.innerHTML = `<span style="width:9px;height:9px;border-radius:50%;background:${t.color};display:inline-block;flex-shrink:0"></span>${esc(name)}${active ? ' ✓' : ''}`;
+        pill.title = active ? 'Remover tag' : 'Adicionar tag';
+        pill.onclick = async () => {
+          if (active) customTags[name].games.delete(gameId);
+          else        customTags[name].games.add(gameId);
+          await persistTags();
+          renderTagChips();
+          renderGames();
+          render();
+        };
+        // Right-click or long-press → delete tag
+        pill.addEventListener('contextmenu', e => { e.preventDefault(); confirmDeleteTag(name); });
+        list.appendChild(pill);
+      });
+      box.appendChild(list);
+    }
+
+    // Divider
+    const div = document.createElement('div');
+    div.style.cssText = 'border-top:1px solid rgba(255,255,255,.08);margin:0 -4px';
+    box.appendChild(div);
+
+    // New tag form
+    const formLabel = document.createElement('div');
+    formLabel.style.cssText = 'font-size:11px;font-weight:600;letter-spacing:1px;color:var(--muted,#6b7280);text-transform:uppercase';
+    formLabel.textContent = 'Nova tag';
+    box.appendChild(formLabel);
+
+    const formRow = document.createElement('div');
+    formRow.style.cssText = 'display:flex;gap:8px;align-items:center';
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'Nome da tag…';
+    nameInput.maxLength = 24;
+    nameInput.style.cssText = 'flex:1;background:var(--surface2,#1a1e28);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:8px 12px;color:var(--text,#e8eaf0);font-size:13px;outline:none';
+
+    // Color picker row
+    const colorRow = document.createElement('div');
+    colorRow.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap';
+    let pickedColor = TAG_PALETTE[0];
+    const colorSwatches = TAG_PALETTE.map(hex => {
+      const sw = document.createElement('button');
+      sw.style.cssText = `width:20px;height:20px;border-radius:50%;background:${hex};border:2px solid ${hex === pickedColor ? 'white' : 'transparent'};cursor:pointer;flex-shrink:0;transition:border .12s`;
+      sw.title = hex;
+      sw.onclick = () => {
+        pickedColor = hex;
+        colorRow.querySelectorAll('button').forEach((s,i) => {
+          s.style.borderColor = TAG_PALETTE[i] === pickedColor ? 'white' : 'transparent';
+        });
+      };
+      return sw;
+    });
+    colorSwatches.forEach(sw => colorRow.appendChild(sw));
+
+    const addBtn = document.createElement('button');
+    addBtn.textContent = '+ Criar';
+    addBtn.style.cssText = 'padding:8px 16px;border-radius:8px;border:none;background:var(--accent2,#6366f1);color:white;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap';
+    addBtn.onclick = async () => {
+      const name = nameInput.value.trim();
+      if (!name) return;
+      if (customTags[name]) { nameInput.style.borderColor = 'var(--red,#e05c5c)'; return; }
+      customTags[name] = { color: pickedColor, games: new Set([gameId]) };
+      await persistTags();
+      renderTagChips();
+      renderGames();
+      render();
+    };
+    nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') addBtn.click(); });
+
+    formRow.appendChild(nameInput);
+    formRow.appendChild(addBtn);
+    box.appendChild(formRow);
+    box.appendChild(colorRow);
+
+    if (Object.keys(customTags).length) {
+      const hint = document.createElement('div');
+      hint.style.cssText = 'font-size:11px;color:var(--muted,#6b7280)';
+      hint.textContent = 'Clique com o botão direito em uma tag para excluí-la.';
+      box.appendChild(hint);
+    }
+  }
+
+  async function confirmDeleteTag(name) {
+    if (!confirm(`Excluir a tag "${name}"? Será removida de todos os jogos.`)) return;
+    delete customTags[name];
+    if (activeTagFilter === name) activeTagFilter = null;
+    await persistTags();
+    renderTagChips();
+    renderGames();
+    render();
+  }
+
+  function cleanup() { overlay.remove(); }
+  overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
+
+  render();
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  setTimeout(() => overlay.querySelector('input')?.focus(), 50);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

@@ -63,16 +63,39 @@
       <!-- Genre filters -->
       <div class="genre-section" id="genre-section" style="display:none">
         <div class="genre-header">
-          <span class="section-label-sm">GÊNEROS</span>
+          <button class="genre-collapse-btn" id="btn-collapse-genres" title="Recolher/expandir">
+            <span class="section-label-sm">GÊNEROS</span>
+            <span class="collapse-arrow" id="collapse-arrow-genres">▾</span>
+          </button>
           <button class="btn-tiny" id="btn-clear-genres">Limpar</button>
         </div>
-        <div id="genre-progress-wrap" style="display:none">
-          <div class="progress-bg"><div class="progress-fill" id="progress-fill"></div></div>
-          <span class="progress-lbl" id="progress-lbl">0 / 0</span>
+        <div id="genre-collapsible">
+          <div id="genre-progress-wrap" style="display:none">
+            <div class="progress-bg"><div class="progress-fill" id="progress-fill"></div></div>
+            <span class="progress-lbl" id="progress-lbl">0 / 0</span>
+          </div>
+          <div class="genre-chips" id="genre-chips"></div>
+          <span class="status-pill" id="genre-status" style="display:none"></span>
         </div>
-        <div class="genre-chips" id="genre-chips"></div>
-        <span class="status-pill" id="genre-status" style="display:none"></span>
       </div>
+
+      <!-- Tag filters -->
+      <div id="tag-filter-section" style="display:none">
+        <div class="genre-header">
+          <button class="genre-collapse-btn" id="btn-collapse-tags" title="Recolher/expandir">
+            <span class="section-label-sm">TAGS</span>
+            <span class="collapse-arrow" id="collapse-arrow-tags">▾</span>
+          </button>
+        </div>
+        <div id="tag-collapsible">
+          <div class="genre-chips" id="tag-filter-chips" style="display:none"></div>
+        </div>
+      </div>
+
+      <!-- Clear all filters button -->
+      <button class="btn-clear-all-filters" id="btn-clear-all-filters" style="display:none">
+        ✕ Limpar todos os filtros
+      </button>
 
     </div>
 
@@ -98,6 +121,9 @@
       </button>
       <button class="tab" data-tab="gog">
         <span class="tab-dot gog-dot"></span> GOG
+      </button>
+      <button class="tab" data-tab="local">
+        <span class="tab-dot local-dot"></span> Local
       </button>
       <button class="tab" data-tab="favorites">
         <span style="font-size:12px">⭐</span> Favoritos
@@ -291,6 +317,18 @@
           </div>
         </div>
       </div>
+      <!-- Local Library section -->
+      <div class="settings-section">
+        <div class="settings-section-title">
+          <span class="source-badge local-badge">LOCAL</span>
+        </div>
+        <p class="settings-desc">Adicione jogos instalados no seu PC que não pertencem a nenhuma loja.</p>
+        <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+          <button class="btn-primary" id="btn-add-local-game">+ Adicionar Jogo Local</button>
+          <button class="btn-ghost" id="btn-scan-local-dir">📁 Escanear Pasta</button>
+        </div>
+      </div>
+
       <!-- Theme section -->
       <div class="settings-section">
         <div class="settings-section-title">APARÊNCIA</div>

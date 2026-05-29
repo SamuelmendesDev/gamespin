@@ -31,10 +31,15 @@ contextBridge.exposeInMainWorld('api', {
   igdbGetGame:        (opts)      => ipcRenderer.invoke('igdb-get-game', opts),
   saveGameName:       (opts)      => ipcRenderer.invoke('save-game-name', opts),
   hltbGet:            (opts)      => ipcRenderer.invoke('hltb-get', opts),
+  installUpdate:      ()          => ipcRenderer.invoke('install-update'),
+  onUpdateAvailable:  (cb)        => ipcRenderer.on('update-available', (_, v) => cb(v)),
+  onUpdateDownloaded: (cb)        => ipcRenderer.on('update-downloaded', () => cb()),
   getFavorites:       ()          => ipcRenderer.invoke('get-favorites'),
   getHiddenGames:     ()          => ipcRenderer.invoke('get-hidden-games'),
   saveHiddenGames:    (arr)       => ipcRenderer.invoke('save-hidden-games', arr),
   saveFavorites:      (arr)       => ipcRenderer.invoke('save-favorites', arr),
+  getTags:            ()          => ipcRenderer.invoke('get-tags'),
+  saveTags:           (obj)       => ipcRenderer.invoke('save-tags', obj),
   // GOG
   gogStartAuth:       ()          => ipcRenderer.invoke('gog-start-auth'),
   gogExchangeCode:    (code)      => ipcRenderer.invoke('gog-exchange-code', code),
@@ -49,8 +54,17 @@ contextBridge.exposeInMainWorld('api', {
   launchGame:         (opts)      => ipcRenderer.invoke('launch-game', opts),
 
   // Local images
-  pickLocalImage:     ()          => ipcRenderer.invoke('pick-local-image'),
-  getLocalImages:     ()          => ipcRenderer.invoke('get-local-images'),
-  saveLocalImage:     (opts)      => ipcRenderer.invoke('save-local-image', opts),
-  deleteLocalImage:   (appid)     => ipcRenderer.invoke('delete-local-image', appid),
+  pickLocalImage:         ()          => ipcRenderer.invoke('pick-local-image'),
+  getLocalImages:         ()          => ipcRenderer.invoke('get-local-images'),
+  saveLocalImage:         (opts)      => ipcRenderer.invoke('save-local-image', opts),
+  deleteLocalImage:       (appid)     => ipcRenderer.invoke('delete-local-image', appid),
+  // Local Library
+  localLibraryGet:        ()          => ipcRenderer.invoke('local-library-get'),
+  localLibraryAdd:        ()          => ipcRenderer.invoke('local-library-add'),
+  localLibraryRemove:     (id)        => ipcRenderer.invoke('local-library-remove', id),
+  localLibraryUpdate:     (opts)      => ipcRenderer.invoke('local-library-update', opts),
+  localLibraryPickCover:  ()          => ipcRenderer.invoke('local-library-pick-cover'),
+  localLibraryLaunch:     (exePath)   => ipcRenderer.invoke('local-library-launch', exePath),
+  localLibraryScanDir:    ()          => ipcRenderer.invoke('local-library-scan-dir'),
+  localLibraryFetchCovers:(games)     => ipcRenderer.invoke('local-library-fetch-covers', games),
 });

@@ -79,7 +79,41 @@ app.whenReady().then(() => {
   setImmediate(() => {
     try { migrateGenreCache(); } catch(e) { console.error('[Migration]', e.message); }
   });
+  // Check for updates (only in packaged app)
+  if (app.isPackaged) {
+    try {
+      const { autoUpdater } = require('electron-updater');
+      autoUpdater.autoDownload = true;
+      autoUpdater.autoInstallOnAppQuit = true;
+
+      autoUpdater.on('update-available', (info) => {
+        win?.webContents.send('update-available', info.version);
+      });
+
+      autoUpdater.on('update-downloaded', () => {
+        win?.webContents.send('update-downloaded');
+      });
+
+      autoUpdater.logger = require('electron-log');
+      autoUpdater.logger.transports.file.level = 'info';
+
+      autoUpdater.on('checking-for-update', () => console.log('[Updater] Checking...'));
+      autoUpdater.on('update-not-available', () => console.log('[Updater] Up to date'));
+      autoUpdater.on('error', (err) => console.log('[Updater] Error:', err.message));
+
+      // Check every 4 hours
+      autoUpdater.checkForUpdates().catch(e => console.log('[Updater] Check failed:', e.message));
+      setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 60 * 60 * 1000);
+    } catch(e) { console.log('[Updater] Not available:', e.message); }
+  }
 });
+ipcMain.handle('install-update', () => {
+  try {
+    const { autoUpdater } = require('electron-updater');
+    autoUpdater.quitAndInstall();
+  } catch {}
+});
+
 app.on('window-all-closed', () => {
   // Only quit when the main window closes, not auth popups
   if (BrowserWindow.getAllWindows().length === 0) {
@@ -477,6 +511,229 @@ ipcMain.handle('pick-local-image', async (event) => {
   if (result.canceled || !result.filePaths.length) return null;
   // Return as file:// URL so Electron renderer can load it
   return 'file://' + result.filePaths[0].replace(/\\/g, '/');
+});
+
+
+//  Local Library (jogos locais sem loja) 
+// Format: [ { id, name, exePath, coverPath, addedAt }, ... ]
+const LOCAL_LIBRARY_FILE = path.join(app.getPath('userData'), 'local_library.json');
+
+function loadLocalLibrary() {
+  try { return JSON.parse(fs.readFileSync(LOCAL_LIBRARY_FILE, 'utf8')); } catch { return []; }
+}
+function saveLocalLibrary(arr) {
+  try { fs.writeFileSync(LOCAL_LIBRARY_FILE, JSON.stringify(arr, null, 2)); } catch {} 
+}
+
+// IPC: get full local library
+ipcMain.handle('local-library-get', () => loadLocalLibrary());
+
+// IPC: add a game — opens dialogs to pick exe then optional cover image
+ipcMain.handle('local-library-add', async (event) => {
+  const senderWin = BrowserWindow.fromWebContents(event.sender);
+
+  // Step 1 — pick the .exe
+  const exeResult = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione o executável do jogo (.exe)',
+    properties: ['openFile'],
+    filters: [{ name: 'Executável', extensions: ['exe', 'bat', 'cmd', 'sh', 'app'] }]
+  });
+  if (exeResult.canceled || !exeResult.filePaths.length) return null;
+  const exePath = exeResult.filePaths[0];
+
+  // Derive a default name from the exe folder (parent dir is usually the game name)
+  const exeDir  = path.dirname(exePath);
+  const dirName = path.basename(exeDir);
+  const exeName = path.basename(exePath, path.extname(exePath));
+  // Prefer folder name unless it's something generic like 'bin', 'Binaries', etc.
+  const genericDirs = /^(bin|binaries|game|win64|win32|x64|x86|release|debug)$/i;
+  const defaultName = genericDirs.test(dirName) ? exeName : dirName;
+
+  // Step 2 — optionally pick a cover image
+  const imgResult = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione uma capa para o jogo (opcional — cancele para pular)',
+    properties: ['openFile'],
+    filters: [{ name: 'Imagens', extensions: ['jpg','jpeg','png','webp','gif'] }]
+  });
+  const coverPath = (!imgResult.canceled && imgResult.filePaths.length)
+    ? imgResult.filePaths[0] : null;
+
+  const id = 'local_' + Date.now();
+  const entry = { id, name: defaultName, exePath, coverPath, addedAt: Date.now() };
+
+  const lib = loadLocalLibrary();
+  lib.push(entry);
+  saveLocalLibrary(lib);
+  return entry;
+});
+
+// IPC: remove a game from local library
+ipcMain.handle('local-library-remove', (_, id) => {
+  const lib = loadLocalLibrary().filter(g => g.id !== id);
+  saveLocalLibrary(lib);
+  return true;
+});
+
+// IPC: update name or cover for a local game
+ipcMain.handle('local-library-update', (_, { id, name, coverPath, _addEntry }) => {
+  const lib = loadLocalLibrary();
+  if (_addEntry) {
+    // Batch add from scan — push new entry if not already present
+    if (!lib.find(g => g.id === _addEntry.id)) lib.push(_addEntry);
+    saveLocalLibrary(lib);
+    return true;
+  }
+  const entry = lib.find(g => g.id === id);
+  if (!entry) return false;
+  if (name !== undefined)      entry.name      = name;
+  if (coverPath !== undefined) entry.coverPath = coverPath;
+  saveLocalLibrary(lib);
+  return true;
+});
+
+// IPC: pick a new cover image for a local game
+ipcMain.handle('local-library-pick-cover', async (event) => {
+  const senderWin = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione uma capa para o jogo',
+    properties: ['openFile'],
+    filters: [{ name: 'Imagens', extensions: ['jpg','jpeg','png','webp','gif'] }]
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  return result.filePaths[0];
+});
+
+// IPC: launch a local game exe directly
+ipcMain.handle('local-library-launch', (_, exePath) => {
+  try {
+    shell.openPath(exePath);
+    return true;
+  } catch { return false; }
+});
+
+// IPC: scan a directory recursively for game executables
+// Returns candidate list: [{ name, exePath, folderName }]
+ipcMain.handle('local-library-scan-dir', async (event) => {
+  const senderWin = BrowserWindow.fromWebContents(event.sender);
+
+  const dirResult = await dialog.showOpenDialog(senderWin, {
+    title: 'Selecione a pasta para escanear',
+    properties: ['openDirectory']
+  });
+  if (dirResult.canceled || !dirResult.filePaths.length) return null;
+  const rootDir = dirResult.filePaths[0];
+
+  // Blacklist of exe names that are launchers, engines, tools — not the game itself
+  const EXE_BLACKLIST = new Set([
+    'unins000','uninstall','uninst','setup','install','installer','update','updater',
+    'crashreporter','crashhandler','crash_reporter','bugsplat','sentry',
+    'ue4prereqsetup_x64','ue4prereqsetup_x86','uereqdsetup',
+    'dxsetup','directx','vcredist_x64','vcredist_x86','dotnetfx',
+    'redist','prerequisite','prereq',
+    'launcher','gamelaunchhelper','start','bootstrapper',
+    'engine','editor','devenv','worldeditor',
+    'steam','steamservice','steamwebhelper','epicgameslauncher',
+    'galaxyclient','gogservices','playnite',
+    'vc_redist.x64','vc_redist.x86',
+    'python','python3','pythonw','node','npm',
+  ]);
+
+  // Folder names to skip entirely
+  const DIR_BLACKLIST = /^(node_modules|__pycache__|\.git|\.svn|redist|redistributable|directx|vcredist|prerequisites|prereq|common\s*redist|support|tools|utilities|editor|sdk|docs|documentation|__macosx)$/i;
+
+  // Max depth to avoid scanning too deep into system dirs
+  const MAX_DEPTH = 6;
+
+  const candidates = [];
+  const seen = new Set();
+
+  function scanDir(dir, depth) {
+    if (depth > MAX_DEPTH) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+    const exesHere = [];
+    const subdirs  = [];
+
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!DIR_BLACKLIST.test(entry.name)) subdirs.push(path.join(dir, entry.name));
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.exe')) {
+        const base = path.basename(entry.name, '.exe').toLowerCase().replace(/[_\-\s]+/g, '');
+        if (!EXE_BLACKLIST.has(base)) {
+          exesHere.push(path.join(dir, entry.name));
+        }
+      }
+    }
+
+    // Heuristic: if a folder has exactly 1 non-blacklisted exe, it's likely the game
+    // If multiple exes, pick the one whose name most closely matches the folder name
+    if (exesHere.length === 1) {
+      const exePath = exesHere[0];
+      if (!seen.has(exePath)) {
+        seen.add(exePath);
+        const folderName = path.basename(dir);
+        const exeName    = path.basename(exePath, '.exe');
+        const genericDirs = /^(bin|binaries|game|win64|win32|x64|x86|release|debug|shipping)$/i;
+        const name = genericDirs.test(folderName) ? exeName : folderName;
+        candidates.push({ name, exePath, folderName });
+      }
+    } else if (exesHere.length > 1) {
+      const folderName  = path.basename(dir).toLowerCase().replace(/[_\-\s]+/g, '');
+      const bestExe     = exesHere.find(e => path.basename(e,'.exe').toLowerCase().replace(/[_\-\s]+/g,'') === folderName)
+                       || exesHere.find(e => path.basename(e,'.exe').toLowerCase().includes(folderName.slice(0,4)))
+                       || exesHere[0];
+      if (!seen.has(bestExe)) {
+        seen.add(bestExe);
+        const exeName = path.basename(bestExe, '.exe');
+        const genericDirs = /^(bin|binaries|game|win64|win32|x64|x86|release|debug|shipping)$/i;
+        const name = genericDirs.test(path.basename(dir)) ? exeName : path.basename(dir);
+        candidates.push({ name, exePath: bestExe, folderName: path.basename(dir) });
+      }
+    }
+
+    // Recurse into subdirs only if this folder didn't yield a game
+    // (avoids adding both "GameFolder" and "GameFolder/bin/game.exe")
+    if (exesHere.length === 0) {
+      for (const sub of subdirs) scanDir(sub, depth + 1);
+    } else {
+      // Still recurse into subdirs to catch multi-game root folders
+      // but only one level deeper to avoid duplicates
+      if (depth < 2) {
+        for (const sub of subdirs) scanDir(sub, depth + 1);
+      }
+    }
+  }
+
+  scanDir(rootDir, 0);
+  console.log(`[LocalScan] Found ${candidates.length} candidates in ${rootDir}`);
+  return { rootDir, candidates };
+});
+
+// IPC: fetch SGDB covers for a list of local game names
+// Returns { name -> coverUrl }
+ipcMain.handle('local-library-fetch-covers', async (_, gamesList) => {
+  const cfg     = loadConfig();
+  const sgdbKey = cfg.sgdbKey || SGDB_DEFAULT_KEY;
+  const results = {};
+  const CONCUR  = 2;
+
+  async function fetchOne(g) {
+    try {
+      const sgdbGame = await sgdbSearch(g.name, sgdbKey);
+      if (!sgdbGame) return;
+      const url = await sgdbGetGrid(sgdbGame.id, sgdbKey);
+      if (url) results[g.id] = url;
+    } catch {}
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  for (let i = 0; i < gamesList.length; i += CONCUR) {
+    await Promise.all(gamesList.slice(i, i + CONCUR).map(fetchOne));
+  }
+
+  console.log(`[LocalScan] Covers fetched: ${Object.keys(results).length}/${gamesList.length}`);
+  return results;
 });
 
 
@@ -1540,6 +1797,20 @@ function saveFavoritesData(arr) {
 
 ipcMain.handle('get-favorites', () => loadFavorites());
 ipcMain.handle('save-favorites', (_, arr) => { saveFavoritesData(arr); return true; });
+
+//  Custom tags persistence 
+// Format: { tagName: { color: '#hex', games: ['id1', 'id2', ...] }, ... }
+const TAGS_FILE = path.join(app.getPath('userData'), 'custom_tags.json');
+
+function loadTags() {
+  try { return JSON.parse(fs.readFileSync(TAGS_FILE, 'utf8')); } catch { return {}; }
+}
+function saveTagsData(obj) {
+  try { fs.writeFileSync(TAGS_FILE, JSON.stringify(obj, null, 2)); } catch {}
+}
+
+ipcMain.handle('get-tags',  ()       => loadTags());
+ipcMain.handle('save-tags', (_, obj) => { saveTagsData(obj); return true; });
 
 //  Local images persistence 
 const LOCAL_IMAGES_FILE = path.join(app.getPath('userData'), 'local_images.json');
