@@ -118,6 +118,43 @@ function toggleTheme() {
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
+// ── Auto-updater notifications ─────────────────────────────────────────────────
+if (window.api.onUpdateAvailable) {
+  window.api.onUpdateAvailable((version) => {
+    showUpdateToast(`Atualização ${version} disponível — baixando…`);
+  });
+  window.api.onUpdateDownloaded(() => {
+    showUpdateToast('Atualização pronta!', true);
+  });
+}
+
+function showUpdateToast(msg, withInstall = false) {
+  const existing = document.getElementById('update-toast');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.id = 'update-toast';
+  toast.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:999;background:#1a9fff;color:white;padding:12px 18px;border-radius:10px;font-size:13px;display:flex;align-items:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3);animation:slideUp .3s ease';
+  toast.innerHTML = `<span>🔄 ${msg}</span>`;
+
+  if (withInstall) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Instalar agora';
+    btn.style.cssText = 'background:white;color:#1a9fff;border:none;border-radius:6px;padding:4px 12px;cursor:pointer;font-weight:600;font-size:12px';
+    btn.onclick = () => window.api.installUpdate();
+    toast.appendChild(btn);
+  }
+
+  const close = document.createElement('button');
+  close.textContent = '✕';
+  close.style.cssText = 'background:none;border:none;color:rgba(255,255,255,.7);cursor:pointer;font-size:14px;padding:0 4px';
+  close.onclick = () => toast.remove();
+  toast.appendChild(close);
+
+  document.body.appendChild(toast);
+  if (!withInstall) setTimeout(() => toast?.remove(), 5000);
+}
+
 window.addEventListener('DOMContentLoaded', async () => {
   bindEvents();
 
@@ -136,7 +173,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (cfg.key && cfg.steamid) {
     $('cfg-key').value     = cfg.key;
     $('cfg-steamid').value = cfg.steamid;
-    if (cfg.steamPath) $('cfg-path').value = cfg.steamPath;
+    if (cfg.steamPath)  $('cfg-path').value  = cfg.steamPath;
+    if (cfg.steamPath2) $('cfg-path2').value = cfg.steamPath2;
   }
 
   splashMsg('Verificando contas…', 25);
@@ -190,6 +228,7 @@ function bindEvents() {
   $('btn-steam-connect').addEventListener('click', connectSteam);
   $('btn-steam-disconnect').addEventListener('click', disconnectSteam);
   $('btn-detect').addEventListener('click', autoDetectSteam);
+  $('btn-detect2').addEventListener('click', autoDetectSteam2);
   $('btn-save-path').addEventListener('click', savePath);
   $('link-apikey').addEventListener('click', () => openLink('https://steamcommunity.com/dev/apikey'));
   $('link-steamid').addEventListener('click', () => openLink('https://steamid.io'));
@@ -295,16 +334,31 @@ async function autoDetectSteam() {
 }
 
 async function savePath() {
-  const steamPath = $('cfg-path').value.trim();
-  if (!steamPath) return;
-  currentConfig.steamPath = steamPath;
+  const steamPath  = $('cfg-path').value.trim();
+  const steamPath2 = $('cfg-path2').value.trim();
+  currentConfig.steamPath  = steamPath;
+  currentConfig.steamPath2 = steamPath2;
   await window.api.saveConfig(currentConfig);
   $('path-hint').textContent = '✓ Salvo';
   $('path-hint').style.color = 'var(--green)';
-  const arr = await window.api.getInstalled(steamPath);
-  installedSteam = new Set(arr.map(id => 'steam_' + id));
+  // Merge installed from both paths
+  const arr1 = steamPath  ? await window.api.getInstalled(steamPath)  : [];
+  const arr2 = steamPath2 ? await window.api.getInstalled(steamPath2) : [];
+  installedSteam = new Set([...arr1, ...arr2].map(id => 'steam_' + id));
   $('cfg-steam-info').textContent = `${steamGames.length} jogos · ${installedSteam.size} instalados`;
   renderGames();
+}
+
+async function autoDetectSteam2() {
+  const res = await window.api.detectSteam();
+  if (res.error) {
+    $('path-hint').textContent = '✗ ' + res.error;
+    $('path-hint').style.color = 'var(--red)';
+    return;
+  }
+  $('cfg-path2').value = res.path;
+  $('path-hint').textContent = '✓ Detectado';
+  $('path-hint').style.color = 'var(--green)';
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────────
@@ -323,7 +377,7 @@ async function connectSteam() {
   $('cfg-steam-error').style.display = 'none';
 
   try {
-    currentConfig = Object.assign(currentConfig, { key, steamid, steamPath: $('cfg-path').value.trim() });
+    currentConfig = Object.assign(currentConfig, { key, steamid, steamPath: $('cfg-path').value.trim(), steamPath2: $('cfg-path2').value.trim() });
     await window.api.saveConfig(currentConfig);
     closeSettings();
     await loadSteamLibrary();
@@ -348,14 +402,16 @@ async function disconnectSteam() {
 async function loadSteamLibrary() {
   const { key, steamid, steamPath } = currentConfig;
   splashMsg('Carregando biblioteca Steam…', 55);
-  const [gamesRes, playerRes, installedArr] = await Promise.all([
+  const steamPath2 = currentConfig.steamPath2 || '';
+  const [gamesRes, playerRes, installedArr, installedArr2] = await Promise.all([
     window.api.getGames({ key, steamid }),
     window.api.getPlayer({ key, steamid }).catch(() => null),
-    steamPath ? window.api.getInstalled(steamPath) : []
+    steamPath  ? window.api.getInstalled(steamPath)  : Promise.resolve([]),
+    steamPath2 ? window.api.getInstalled(steamPath2) : Promise.resolve([])
   ]);
 
   steamGames     = gamesRes.games.map(g => Object.assign(g, { source: 'steam', id: 'steam_' + g.appid }));
-  installedSteam = new Set(installedArr.map(id => 'steam_' + id));
+  installedSteam = new Set([...installedArr, ...installedArr2].map(id => 'steam_' + id));
 
   if (playerRes) {
     updateSteamUI(playerRes, gamesRes.games.length);
@@ -388,6 +444,7 @@ function updateSteamUI(playerRes, count) {
   $('cfg-steam-connected').style.display    = '';
   $('cfg-steam-disconnected').style.display = 'none';
   $('cfg-path-section').style.display       = '';
+  if (currentConfig.steamPath2) $('cfg-path2').value = currentConfig.steamPath2;
   $('sidebar-steam-avatar').src = playerRes.avatar;
   $('sidebar-steam-name').textContent = playerRes.name;
   $('steam-account-row').style.display = 'flex';

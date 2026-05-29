@@ -207,15 +207,23 @@
 
       <!-- Steam path section -->
       <div class="settings-section" id="cfg-path-section" style="display:none">
-        <div class="settings-section-title">PASTA DO STEAM</div>
+        <div class="settings-section-title">PASTAS DO STEAM</div>
         <div class="field">
+          <label>Caminho principal</label>
           <div class="path-row">
             <input type="text" id="cfg-path" placeholder="C:\Program Files (x86)\Steam">
             <button class="btn-ghost" id="btn-detect">Detectar</button>
           </div>
-          <span class="hint" id="path-hint">Para detectar jogos instalados</span>
         </div>
-        <button class="btn-ghost" id="btn-save-path">Salvar caminho</button>
+        <div class="field">
+          <label>Caminho adicional <span style="opacity:.5">(opcional)</span></label>
+          <div class="path-row">
+            <input type="text" id="cfg-path2" placeholder="D:\Steam ou outro disco…">
+            <button class="btn-ghost" id="btn-detect2">Detectar</button>
+          </div>
+        </div>
+        <span class="hint" id="path-hint">Para detectar jogos instalados em múltiplos discos</span>
+        <button class="btn-ghost" id="btn-save-path">Salvar caminhos</button>
       </div>
 
       <!-- Epic section -->
