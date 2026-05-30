@@ -1897,8 +1897,8 @@ async function fetchIgdbGenresBackground(source) {
   const toFetch = sourceGames
     .filter(g => {
       const gd = genreData[g.id];
-      // For local/emulator: fetch if missing genres OR description
-      if (isLocalSource) return !gd?.genres?.length || !gd?.description;
+      // For local/emulator: fetch if missing genres only (description optional)
+      if (isLocalSource) return !gd?.genres?.length;
       // For store games: fetch if missing genres
       return !gd?.genres?.length;
     })

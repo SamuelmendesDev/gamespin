@@ -19,11 +19,13 @@ try {
 }
 
 //  Cache dir 
-const CACHE_DIR  = path.join(app.getPath('userData'), 'cache');
+const CACHE_DIR   = path.join(app.getPath('userData'), 'cache');
+const COVERS_DIR  = path.join(app.getPath('userData'), 'covers');
 const CONFIG_FILE = path.join(app.getPath('userData'), 'config.json');
 const CACHE_TTL  = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+if (!fs.existsSync(CACHE_DIR))  fs.mkdirSync(CACHE_DIR,  { recursive: true });
+if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR, { recursive: true });
 
 //  Bulk app-details cache (single file, much faster than one-file-per-app) 
 const BULK_CACHE_FILE = path.join(app.getPath('userData'), 'appdetails_cache.json');
@@ -614,6 +616,21 @@ function stripHtml(h) {
 }
 
 // Pick local image for a game
+
+// Copy an image to the covers folder and return the new path
+function copyToCoverDir(srcPath) {
+  try {
+    const ext  = path.extname(srcPath).toLowerCase() || '.jpg';
+    const name = Date.now() + '_' + Math.random().toString(36).slice(2,8) + ext;
+    const dest = path.join(COVERS_DIR, name);
+    fs.copyFileSync(srcPath, dest);
+    return dest;
+  } catch(e) {
+    console.error('[Covers] Copy failed:', e.message);
+    return srcPath; // fallback to original path
+  }
+}
+
 ipcMain.handle('pick-local-image', async (event) => {
   const senderWin = BrowserWindow.fromWebContents(event.sender);
   const result = await dialog.showOpenDialog(senderWin, {
@@ -622,8 +639,8 @@ ipcMain.handle('pick-local-image', async (event) => {
     filters: [{ name: 'Imagens', extensions: ['jpg','jpeg','png','webp','gif'] }]
   });
   if (result.canceled || !result.filePaths.length) return null;
-  // Return as file:// URL so Electron renderer can load it
-  return 'file://' + result.filePaths[0].replace(/\\/g, '/');
+  const copied = copyToCoverDir(result.filePaths[0]);
+  return 'file://' + copied.replace(/\\/g, '/');
 });
 
 
@@ -669,7 +686,7 @@ ipcMain.handle('local-library-add', async (event) => {
     filters: [{ name: 'Imagens', extensions: ['jpg','jpeg','png','webp','gif'] }]
   });
   const coverPath = (!imgResult.canceled && imgResult.filePaths.length)
-    ? imgResult.filePaths[0] : null;
+    ? copyToCoverDir(imgResult.filePaths[0]) : null;
 
   const id = 'local_' + Date.now();
   const entry = { id, name: defaultName, exePath, coverPath, addedAt: Date.now() };
@@ -713,7 +730,7 @@ ipcMain.handle('local-library-pick-cover', async (event) => {
     filters: [{ name: 'Imagens', extensions: ['jpg','jpeg','png','webp','gif'] }]
   });
   if (result.canceled || !result.filePaths.length) return null;
-  return result.filePaths[0];
+  return copyToCoverDir(result.filePaths[0]);
 });
 
 // IPC: launch a local game exe directly
@@ -2288,7 +2305,9 @@ ipcMain.handle('get-local-images', () => loadLocalImages());
 
 ipcMain.handle('save-local-image', (_, { appid, filePath }) => {
   const map = loadLocalImages();
-  map[appid] = filePath;
+  // filePath may already be in covers dir (from pick-local-image) or be a raw path
+  const safePath = filePath.startsWith(COVERS_DIR) ? filePath : copyToCoverDir(filePath);
+  map[appid] = safePath;
   saveLocalImages(map);
   return true;
 });
