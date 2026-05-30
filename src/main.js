@@ -4,6 +4,20 @@ const path  = require('path');
 const fs    = require('fs');
 const fetch = require('node-fetch');
 
+// Initialize logging immediately so log file is always created
+let _log;
+try {
+  _log = require('electron-log');
+  _log.transports.file.level    = 'debug';
+  _log.transports.console.level = 'debug';
+  _log.info('[App] Starting GameSpin', process.versions.electron);
+} catch(e) {
+  // Fallback to console if electron-log not available
+  _log = { info: console.log, error: console.error, warn: console.warn,
+    transports: { file: { level: 'debug', getFile: () => null } } };
+  console.warn('[App] electron-log not available, using console:', e.message);
+}
+
 //  Cache dir 
 const CACHE_DIR  = path.join(app.getPath('userData'), 'cache');
 const CONFIG_FILE = path.join(app.getPath('userData'), 'config.json');
@@ -93,49 +107,43 @@ app.whenReady().then(() => {
   win.webContents.once('did-finish-load', () => {
     if (!app.isPackaged) return; // dev mode — skip
     try {
-      const log           = require('electron-log');
       const { autoUpdater } = require('electron-updater');
 
-      // Force log to file so we can diagnose
-      log.transports.file.level     = 'debug';
-      log.transports.file.resolvePathFn = () =>
-        require('path').join(app.getPath('userData'), 'logs', 'updater.log');
-      log.transports.console.level  = 'debug';
-      autoUpdater.logger            = log;
-
+      _log.transports.file.level = 'debug';
+      autoUpdater.logger = _log;
       autoUpdater.autoDownload         = false;
       autoUpdater.autoInstallOnAppQuit = true;
       autoUpdater.allowPrerelease      = false;
       autoUpdater.forceDevUpdateConfig = false;
 
-      // Set feed URL explicitly from package.json publish config
       autoUpdater.setFeedURL({
         provider: 'github',
         owner:    'SamuelmendesDev',
         repo:     'gamespin',
       });
 
-      log.info(`[Updater] App version: ${app.getVersion()}`);
-      log.info(`[Updater] Feed: github/SamuelmendesDev/gamespin`);
+      _log.info(`[Updater] App version: ${app.getVersion()}`);
+      _log.info(`[Updater] Feed: github/SamuelmendesDev/gamespin`);
+      _log.info(`[Updater] Log file: ${_log.transports.file.getFile?.()?.path || 'unknown'}`);
 
       const sendToRenderer = (channel, data) => {
         if (win && !win.isDestroyed()) win.webContents.send(channel, data);
       };
 
       autoUpdater.on('checking-for-update', () => {
-        log.info('[Updater] Checking for updates...');
+        _log.info('[Updater] Checking for updates...');
         sendToRenderer('update-checking', {});
       });
       autoUpdater.on('update-not-available', (info) => {
-        log.info('[Updater] Up to date:', info.version);
+        _log.info('[Updater] Up to date:', info.version);
         sendToRenderer('update-not-available', { version: info.version });
       });
       autoUpdater.on('error', (err) => {
-        log.error('[Updater] Error:', err.message, err.stack);
+        _log.error('[Updater] Error:', err.message, err.stack);
         sendToRenderer('update-error', { message: err.message });
       });
       autoUpdater.on('update-available', (info) => {
-        log.info(`[Updater] Update available: v${info.version}`);
+        _log.info(`[Updater] Update available: v${info.version}`);
         sendToRenderer('update-available', {
           version:      info.version,
           releaseNotes: typeof info.releaseNotes === 'string' ? info.releaseNotes : '',
@@ -143,7 +151,7 @@ app.whenReady().then(() => {
         });
       });
       autoUpdater.on('download-progress', (progress) => {
-        log.info(`[Updater] Download progress: ${Math.round(progress.percent)}%`);
+        _log.info(`[Updater] Download progress: ${Math.round(progress.percent)}%`);
         sendToRenderer('update-progress', {
           percent:        Math.round(progress.percent),
           transferred:    progress.transferred,
@@ -152,26 +160,26 @@ app.whenReady().then(() => {
         });
       });
       autoUpdater.on('update-downloaded', (info) => {
-        log.info(`[Updater] Downloaded: v${info.version}`);
+        _log.info(`[Updater] Downloaded: v${info.version}`);
         sendToRenderer('update-downloaded', { version: info.version });
       });
 
       // Check on launch
       setTimeout(() => {
-        log.info('[Updater] Starting initial check...');
+        _log.info('[Updater] Starting initial check...');
         autoUpdater.checkForUpdates()
-          .then(result => log.info('[Updater] Check result:', JSON.stringify(result?.updateInfo || {})))
+          .then(result => _log.info('[Updater] Check result:', JSON.stringify(result?.updateInfo || {})))
           .catch(e => {
-            log.error('[Updater] Check failed:', e.message);
+            _log.error('[Updater] Check failed:', e.message);
             sendToRenderer('update-error', { message: e.message });
           });
       }, 3000);
 
       // Re-check every 2 hours
-      setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[Updater] Periodic check failed:', e.message)), 2 * 60 * 60 * 1000);
+      setInterval(() => autoUpdater.checkForUpdates().catch(e => _log.error('[Updater] Periodic check failed:', e.message)), 2 * 60 * 60 * 1000);
 
     } catch(e) {
-      require('electron-log').error('[Updater] Init failed:', e.message, e.stack);
+      _log.error('[Updater] Init failed:', e.message, e.stack);
     }
   });
 });
@@ -187,9 +195,12 @@ ipcMain.handle('update-check-now', () => {
 
 ipcMain.handle('get-app-version', () => app.getVersion());
 
-ipcMain.handle('get-log-path', () =>
-  require('path').join(app.getPath('userData'), 'logs', 'updater.log')
-);
+ipcMain.handle('get-log-path', () => {
+  try {
+    return _log.transports.file.getFile?.()?.path
+      || require('path').join(app.getPath('userData'), 'logs', 'main.log');
+  } catch(e) { return require('path').join(app.getPath('userData'), 'logs', 'main.log'); }
+});
 
 ipcMain.handle('update-download', () => {
   try {
